@@ -1,0 +1,13 @@
+M5 Pro, macOS arm64
+Tool: hyperfine 2.0.0, --warmup 3 --runs 10 --shell=none
+Input: 2,182,862,808-byte temporary file made from a read-only 272,857,851-byte CCH Claude transcript repeated 8 times.
+All comparisons read this same copy. Warmup runs primed the page cache. Output is suppressed.
+Raw command output: docs/bench/m5-hyperfine.txt
+Raw measurements: docs/bench/m5-hyperfine.json
+
+Mean wall time (10 runs):
+- jlogtail --lines 1000: 5.049 ms (σ 0.290 ms; min 4.573 ms; max 5.477 ms)
+- tail -n 1000 | jq -c .: 66.516 ms (σ 3.233 ms; min 61.381 ms; max 71.081 ms)
+- Python full read + splitlines + last 1000: 1395.601 ms (σ 188.841 ms; min 1259.268 ms; max 1877.208 ms)
+
+The Rust reader seeks backward from EOF and reads the selected suffix. The two comparison commands scan the complete 2.18 GB file.
