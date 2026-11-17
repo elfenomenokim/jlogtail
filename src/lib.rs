@@ -140,7 +140,9 @@ fn classify(row: &Value) -> &'static str {
         return "skip";
     }
     let Some(content) = payload.get("content").and_then(Value::as_array) else {
-        return "skip";
+        // The reference tail treats a user message it cannot represent as a
+        // barrier: the scan stops instead of stepping over a gap.
+        return if role == Some("user") { "barrier" } else { "skip" };
     };
     if role == Some("user")
         && (content.is_empty()
@@ -309,6 +311,13 @@ fn prefix_proves_nonmessage(prefix: &[u8]) -> bool {
     phase == b"commentary" || phase == b"analysis"
 }
 
+fn parse_line(line: &[u8]) -> Result<Value, ()> {
+    // `json.loads` in the reference reads bytes and skips a UTF-8 BOM; serde_json
+    // rejects one. Strip it for classification only: the emitted record keeps it.
+    let line = line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(line);
+    serde_json::from_slice(line).map_err(|_| ())
+}
+
 /// Read the bounded recent Codex message window used by feno-handoff.
 pub fn select_native(path: &Path) -> std::io::Result<(Value, Vec<Vec<u8>>)> {
     let mut file = File::open(path)?;
@@ -358,7 +367,7 @@ pub fn select_native(path: &Path) -> std::io::Result<(Value, Vec<Vec<u8>>)> {
             if line.is_empty() {
                 continue;
             }
-            let row: Value = match serde_json::from_slice(&line) {
+            let row: Value = match parse_line(&line) {
                 Ok(v) => v,
                 Err(_) => {
                     source_gap_reason = Some("invalid_native_record");
@@ -402,7 +411,7 @@ pub fn select_native(path: &Path) -> std::io::Result<(Value, Vec<Vec<u8>>)> {
         && !candidate_cap_reached
         && source_gap_reason.is_none()
     {
-        match serde_json::from_slice::<Value>(&pending) {
+        match parse_line(&pending) {
             Err(_) => source_gap_reason = Some("invalid_native_record"),
             Ok(row) => match classify(&row) {
                 "barrier" => source_gap_reason = Some("unrepresentable_user_message"),
@@ -492,4 +501,35 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tail_raw, m)?)?;
     m.add_function(wrap_pyfunction!(cli_entry, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // The reference tail treats a user message without a representable content
+    // array as a barrier; skipping it would let the scan cross a gap.
+    #[test]
+    fn user_message_without_content_is_a_barrier() {
+        for payload in [
+            json!({"type": "message", "role": "user"}),
+            json!({"type": "message", "role": "user", "content": "plain"}),
+            json!({"type": "message", "role": "user", "content": []}),
+        ] {
+            let row = json!({"type": "response_item", "payload": payload});
+            assert_eq!(classify(&row), "barrier", "{row}");
+        }
+        let assistant = json!({"type": "response_item",
+            "payload": {"type": "message", "role": "assistant"}});
+        assert_eq!(classify(&assistant), "skip");
+    }
+
+    // `json.loads` reads bytes and skips a UTF-8 BOM; serde_json rejects it.
+    #[test]
+    fn bom_prefixed_record_parses() {
+        assert!(parse_line(b"\xef\xbb\xbf{\"a\":1}").is_ok());
+        assert!(parse_line(b"{\"a\":1}").is_ok());
+        assert!(parse_line(b"{").is_err());
+    }
 }
