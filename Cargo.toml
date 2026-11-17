@@ -10,7 +10,7 @@ name = "jlogtail"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-extension-module = ["dep:pyo3", "pyo3/extension-module"]
+extension-module = ["dep:pyo3", "pyo3/extension-module", "pyo3/abi3-py39"]
 
 [[bin]]
 name = "jlogtail"
