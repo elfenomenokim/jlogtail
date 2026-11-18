@@ -1,3 +1,5 @@
+<div align="center">
+
 <img src="https://raw.githubusercontent.com/elfenomenokim/jlogtail/main/docs/logo.svg" width="96" height="96" alt="jlogtail: the last lines of a file, measured from the end">
 
 # jlogtail
@@ -11,6 +13,10 @@ Rust · Python 3.9+
 [![license](https://img.shields.io/github/license/elfenomenokim/jlogtail)](https://github.com/elfenomenokim/jlogtail/blob/main/LICENSE)
 
 5.0 ms for the tail of a 2.18 GB transcript, against 66.5 ms for `tail | jq` and 1395.6 ms for a full Python read, from the saved 10-run file.
+
+[Install](#install) · [Quick start](#quick-start) · [How it reads](#how-it-reads)
+
+</div>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/elfenomenokim/jlogtail/main/docs/demo/dark.gif">

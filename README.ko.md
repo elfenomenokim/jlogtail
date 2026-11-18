@@ -1,3 +1,5 @@
+<div align="center">
+
 <img src="https://raw.githubusercontent.com/elfenomenokim/jlogtail/main/docs/logo.svg" width="96" height="96" alt="파일 끝에서부터 마지막 줄만 읽는 모습을 나타낸 아이콘">
 
 # jlogtail
@@ -11,6 +13,10 @@ Rust · Python 3.9+
 [![license](https://img.shields.io/github/license/elfenomenokim/jlogtail)](https://github.com/elfenomenokim/jlogtail/blob/main/LICENSE)
 
 2.18GB 대화 기록의 끝을 읽는 데 5.0ms입니다. `tail | jq`는 66.5ms, Python으로 전체를 읽으면 1395.6ms입니다. 저장된 10회 측정에서 가져왔습니다.
+
+[설치](#설치) · [시작하기](#시작하기) · [읽는 순서](#읽는-순서)
+
+</div>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/elfenomenokim/jlogtail/main/docs/demo/dark.gif">
