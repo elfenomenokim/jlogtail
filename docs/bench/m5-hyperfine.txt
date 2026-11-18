@@ -1,0 +1,15 @@
+Benchmark 1: target/release/jlogtail /tmp/jlogtail-hyperfine-copy.jsonl --lines 1000 (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      5.0 ms  ±     0.3 ms       4.6 ms  …     5.5 ms
+  Memory         4.7 MiB ±     0.1 MiB      4.5 MiB …     4.8 MiB
+ 
+Benchmark 2: /bin/sh -c "tail -n 1000 /tmp/jlogtail-hyperfine-copy.jsonl | jq -c . > /dev/null" (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time     66.5 ms  ±     3.2 ms      61.4 ms  …    71.1 ms         +1217.3%  (13.2x slower)
+  Memory         3.9 MiB ±     0.0 MiB      3.9 MiB …     3.9 MiB          -18.2%
+ 
+Benchmark 3: python3 -c "import sys; data=open(sys.argv[1], \"rb\").read().splitlines(); data[-1000:]" /tmp/jlogtail-hyperfine-copy.jsonl (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time   1395.6 ms  ±   188.8 ms    1259.3 ms  …  1877.2 ms        +27539.9%  (276.4x slower)
+  Memory      4412.6 MiB ±     0.1 MiB   4412.4 MiB …  4412.6 MiB       +93133.6%  (932.3x more)
+ 
