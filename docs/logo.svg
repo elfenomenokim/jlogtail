@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96" role="img" aria-label="jlogtail: the last lines of a file, measured from the end">
+  <rect width="96" height="96" rx="20" fill="#ECEBFB"/>
+  <g fill="none" stroke="#4338CA" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M22 30h34M22 46h34M22 62h22"/>
+    <path d="M66 26v44M66 26h8M66 70h8"/>
+  </g>
+</svg>

@@ -1,0 +1,22 @@
+[package]
+name = "jlogtail"
+version = "0.1.2"
+edition = "2021"
+description = "Tail large JSON Lines transcripts by record or byte window"
+license = "MIT"
+
+[lib]
+name = "jlogtail"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+extension-module = ["dep:pyo3", "pyo3/extension-module", "pyo3/abi3-py39"]
+
+[[bin]]
+name = "jlogtail"
+path = "src/main.rs"
+
+[dependencies]
+pyo3 = { version = "0.27.2", optional = true }
+serde_json = "1"
+file-id = "0.2.3"

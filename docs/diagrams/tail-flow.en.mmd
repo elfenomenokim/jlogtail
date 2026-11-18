@@ -1,0 +1,13 @@
+flowchart LR
+    A["Open transcript"] --> B["Seek backward to requested boundary"]
+    B --> C["Read complete JSONL suffix"]
+    C --> D["Filter and select fields"]
+    D --> E{"Follow enabled?"}
+    E -->|No| F["Exit"]
+    E -->|Yes| G["Check file identity and length"]
+    G -->|Rotated or truncated| H["Reset offset"]
+    H --> I["Read appended bytes"]
+    G -->|Same file| I
+    I --> J{"Newline complete?"}
+    J -->|No| I
+    J -->|Yes| D

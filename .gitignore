@@ -1,0 +1,7 @@
+/target/
+/.venv/
+__pycache__/
+*.py[cod]
+
+/docs/demo/_bench-copy.jsonl
+/docs/demo/_preview.png
