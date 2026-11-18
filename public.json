@@ -12,6 +12,7 @@
   ],
   "files": [
     ".github/workflows/wheels.yml",
+    ".github/workflows/opencode-review.yml",
     ".gitignore",
     "AGENTS.md",
     "Cargo.lock",

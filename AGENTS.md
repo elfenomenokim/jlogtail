@@ -30,3 +30,16 @@ Run `cargo build --release` in this directory. Install the Rust command with `ca
 ## Checks
 
 Build the Rust CLI with `cargo build --release`. Inspect the actual output with a small synthetic JSONL fixture. The public package has not been released.
+
+## Code Review Rules
+
+A change is a real defect when it:
+
+- reads the whole file instead of the requested suffix or byte window.
+- drifts a byte window off a line boundary, exposing a partial last line as a record.
+- emits an incomplete record in follow mode, drops the unterminated suffix it must keep, or misses a rotation because file IDs are not compared.
+- classifies an oversized record from the segment holding it instead of from its own first bytes.
+- moves Python `tail()` off the shared Rust suffix reader, or changes the `native-history-tail.py` metadata keys or oldest-to-newest order.
+- changes a CLI flag, JSON field or exit code that the README documents.
+
+Not defects: wording, formatting, comment style, requested extra tests, or a renamed helper.
