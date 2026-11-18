@@ -18,10 +18,12 @@ Rust · Python 3.9+
 
 </div>
 
+<p align="center">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/elfenomenokim/jlogtail/main/docs/demo/dark.gif">
   <img src="https://raw.githubusercontent.com/elfenomenokim/jlogtail/main/docs/demo/light.gif" alt="작은 JSONL 예시에서 최근 대화 필드를 고르는 CLI" width="1200">
 </picture>
+</p>
 
 [소셜 미리보기 이미지](https://raw.githubusercontent.com/elfenomenokim/jlogtail/main/docs/social.png)
 

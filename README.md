@@ -18,10 +18,12 @@ Rust · Python 3.9+
 
 </div>
 
+<p align="center">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/elfenomenokim/jlogtail/main/docs/demo/dark.gif">
   <img src="https://raw.githubusercontent.com/elfenomenokim/jlogtail/main/docs/demo/light.gif" alt="The CLI selects recent transcript fields from a small JSONL fixture" width="1200">
 </picture>
+</p>
 
 [Social preview](https://raw.githubusercontent.com/elfenomenokim/jlogtail/main/docs/social.png)
 
