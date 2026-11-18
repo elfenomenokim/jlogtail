@@ -1,0 +1,2 @@
+{"timestamp":"t1","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"text","text":"hello"}]}}
+{"timestamp":"t2","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"text","text":"world"}]}}

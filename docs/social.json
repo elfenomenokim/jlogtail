@@ -1,0 +1,34 @@
+{
+  "name": "jlogtail",
+  "sentence": "A Rust command-line tool and Python module that read the end of large JSON Lines transcripts without loading the whole file.",
+  "tag": "RUST · JSONL",
+  "terminal": [
+    "$ jlogtail agents.jsonl --lines 2",
+    "{\"role\":\"assistant\",\"text\":\"Checkpoint saved\"}",
+    "{\"role\":\"assistant\",\"text\":\"Next run queued\"}"
+  ],
+  "metric": {
+    "kind": "hyperfine",
+    "source": "docs/bench/m5-hyperfine.json",
+    "field": "time_wall_clock",
+    "scale": 1000,
+    "title": "Read the last 1,000 lines",
+    "basis": "M5 · 10 runs · 2.18 GB file",
+    "unit": "ms",
+    "precision": 1,
+    "items": [
+      {
+        "label": "jlogtail",
+        "match": "target/release/jlogtail"
+      },
+      {
+        "label": "tail + jq",
+        "match": "tail -n 1000"
+      },
+      {
+        "label": "Python full read",
+        "match": "data[-1000:]"
+      }
+    ]
+  }
+}
