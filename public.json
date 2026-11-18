@@ -61,5 +61,6 @@
     ".github/ISSUE_TEMPLATE/config.yml",
     ".github/pull_request_template.md",
     "docs/logo.svg"
-  ]
+  ],
+  "pypi": "https://pypi.org/project/jlogtail/"
 }
