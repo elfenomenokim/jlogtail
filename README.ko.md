@@ -31,7 +31,7 @@ jlogtail transcript.jsonl --filter payload.role=assistant --fields timestamp,pay
 jlogtail transcript.jsonl --follow
 ```
 
-Claude Code, Codex, Pi 대화 기록에 같은 명령을 쓸 수 있습니다. CLI는 기본적으로 원래 JSONL 행을 출력합니다. `--fields`는 선택한 점 경로만 간결한 객체로 출력합니다. `--filter PATH=VALUE`는 JSON 값과 비교하며, JSON 문법이 아닌 값은 문자열로 처리합니다. 바이트 창은 첫 행이 잘린 경우에만 건너뜁니다. `--follow`는 추가된 바이트를 한 번씩 읽고, 끝이 잘린 행을 메모리에 보관했다가 줄바꿈이 오면 출력합니다.
+Claude Code, Codex, Pi 대화 기록에 같은 명령을 쓸 수 있습니다. CLI는 기본적으로 원래 JSONL 행을 출력합니다. `--fields`는 선택한 점 경로만 간결한 객체로 출력합니다. `--filter PATH=VALUE`는 JSON 값과 비교하며, JSON 문법이 아닌 값은 문자열로 처리합니다. 바이트 창은 첫 행이 잘린 경우에만 건너뜁니다. `--follow`는 추가된 바이트를 한 번씩 읽고, 끝이 잘린 행을 메모리에 보관했다가 줄바꿈이 오면 출력합니다. follow를 시작할 때 이미 끝나지 않은 행이 있으면 첫 바이트부터 보관하므로, 첫 확인에서 조각이 아니라 완성된 행을 출력합니다.
 
 ```console
 $ jlogtail docs/demo/agents.jsonl --lines 2 --fields role,text

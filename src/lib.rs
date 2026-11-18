@@ -37,6 +37,8 @@ pub fn read_tail(
         let n = lines.unwrap_or(10);
         let mut logical_end = size;
         let mut has_final_newline = false;
+        // First byte of the record still being written when the file ends mid-line.
+        let mut trailing_start = size;
         if size > 0 {
             file.seek(SeekFrom::Start(size - 1))?;
             let mut last = [0u8; 1];
@@ -55,7 +57,16 @@ pub fn read_tail(
                         found = Some(scan + i as u64);
                     }
                 }
-                logical_end = found.unwrap_or(0);
+                match found {
+                    Some(i) => {
+                        logical_end = i;
+                        trailing_start = i + 1;
+                    }
+                    None => {
+                        logical_end = 0;
+                        trailing_start = 0;
+                    }
+                }
             }
         }
         let mut pos = logical_end;
@@ -83,7 +94,9 @@ pub fn read_tail(
             }
         }
         if n == 0 || logical_end == 0 {
-            start = size;
+            // Resume at the first byte of an unterminated final record, not at
+            // EOF: follow must emit that record whole once its newline arrives.
+            start = trailing_start;
         }
     }
     let mut starts_on_boundary = start == 0;
@@ -318,6 +331,25 @@ fn parse_line(line: &[u8]) -> Result<Value, ()> {
     serde_json::from_slice(line).map_err(|_| ())
 }
 
+/// Read one record's leading bytes so an oversized record can be classified even
+/// when it starts in the last bytes of a scan block.
+fn read_prefix(file: &mut File, offset: u64) -> std::io::Result<Vec<u8>> {
+    const PROBE: usize = 4096;
+    let mut probe = vec![0u8; PROBE];
+    file.seek(SeekFrom::Start(offset))?;
+    let mut filled = 0;
+    while filled < probe.len() {
+        match file.read(&mut probe[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    probe.truncate(filled);
+    Ok(probe)
+}
+
 /// Read the bounded recent Codex message window used by feno-handoff.
 pub fn select_native(path: &Path) -> std::io::Result<(Value, Vec<Vec<u8>>)> {
     let mut file = File::open(path)?;
@@ -326,7 +358,6 @@ pub fn select_native(path: &Path) -> std::io::Result<(Value, Vec<Vec<u8>>)> {
     let mut scanned = 0u64;
     let mut pending: Vec<u8> = Vec::new();
     let mut overlong = false;
-    let mut overlong_prefix: Vec<u8> = Vec::new();
     let mut newest_first: Vec<Vec<u8>> = Vec::new();
     let mut selected_bytes = 0usize;
     let mut skipped_overlong_nonmessage = 0usize;
@@ -345,15 +376,23 @@ pub fn select_native(path: &Path) -> std::io::Result<(Value, Vec<Vec<u8>>)> {
         file.read_exact(&mut block)?;
         scanned += amount as u64;
         let pieces: Vec<&[u8]> = block.split(|b| *b == b'\n').collect();
-        for segment in pieces.iter().skip(1).rev() {
+        // Each piece's byte offset inside the block; the last piece has no
+        // trailing newline, so this only overruns for unused entries.
+        let mut piece_offsets = Vec::with_capacity(pieces.len());
+        let mut cursor = 0usize;
+        for piece in &pieces {
+            piece_offsets.push(cursor);
+            cursor += piece.len() + 1;
+        }
+        for (index, segment) in pieces.iter().enumerate().skip(1).rev() {
             if overlong || segment.len() + pending.len() > RECORD_CAP {
-                if prefix_proves_nonmessage(segment) {
+                let probe = read_prefix(&mut file, position + piece_offsets[index] as u64)?;
+                if prefix_proves_nonmessage(&probe) {
                     skipped_overlong_nonmessage += 1;
                 } else {
                     source_gap_reason = Some("oversized_unclassified_record");
                 }
                 overlong = false;
-                overlong_prefix.clear();
                 pending.clear();
                 if source_gap_reason.is_some() {
                     break;
@@ -395,9 +434,6 @@ pub fn select_native(path: &Path) -> std::io::Result<(Value, Vec<Vec<u8>>)> {
         let first = pieces[0];
         if overlong || first.len() + pending.len() > RECORD_CAP {
             overlong = true;
-            if overlong_prefix.is_empty() {
-                overlong_prefix.extend_from_slice(&first[..first.len().min(4096)]);
-            }
             pending.clear();
         } else {
             let mut next = first.to_vec();
@@ -427,7 +463,7 @@ pub fn select_native(path: &Path) -> std::io::Result<(Value, Vec<Vec<u8>>)> {
         }
     }
     if position == 0 && overlong && source_gap_reason.is_none() {
-        if prefix_proves_nonmessage(&overlong_prefix) {
+        if prefix_proves_nonmessage(&read_prefix(&mut file, 0)?) {
             skipped_overlong_nonmessage += 1;
         } else {
             source_gap_reason = Some("oversized_unclassified_record");
@@ -531,5 +567,97 @@ mod tests {
         assert!(parse_line(b"\xef\xbb\xbf{\"a\":1}").is_ok());
         assert!(parse_line(b"{\"a\":1}").is_ok());
         assert!(parse_line(b"{").is_err());
+    }
+
+    fn scratch_file(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "jlogtail-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("t.jsonl")
+    }
+
+    fn read_from(path: &Path, offset: u64) -> Vec<u8> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = File::open(path).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut out = Vec::new();
+        file.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    // Follow must keep the record prefix that is already in the file; resuming
+    // at EOF would emit only the part appended later.
+    #[test]
+    fn follow_window_keeps_an_unterminated_record() {
+        let path = scratch_file("follow");
+        std::fs::write(&path, b"{\"a\":").unwrap();
+        let window = read_tail(&path, Some(10), None, false).unwrap();
+        assert!(window.bytes.is_empty());
+        assert_eq!(window.end_offset, 0);
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"1}\n").unwrap();
+        assert_eq!(read_from(&path, window.end_offset), b"{\"a\":1}\n");
+    }
+
+    #[test]
+    fn zero_line_window_resumes_at_the_unterminated_record() {
+        let path = scratch_file("zero");
+        std::fs::write(&path, b"{\"a\":1}\n{\"b\":").unwrap();
+        let window = read_tail(&path, Some(0), None, false).unwrap();
+        assert!(window.bytes.is_empty());
+        assert_eq!(window.end_offset, 8);
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"2}\n").unwrap();
+        assert_eq!(read_from(&path, window.end_offset), b"{\"b\":2}\n");
+    }
+
+    // A 65,534-byte user row puts the following oversized function output in the
+    // last byte of its 64 KiB scan block, leaving only `{` of its header visible.
+    fn aligned_oversized_fixture() -> Vec<u8> {
+        fn row(text: &str) -> String {
+            json!({"type": "response_item",
+                "payload": {"type": "message", "role": "user",
+                    "content": [{"text": text}]}})
+            .to_string()
+        }
+        let base = row("OLD").len();
+        let text = format!("OLD{}", "p".repeat(65534 - base));
+        let mut out = row(&text).into_bytes();
+        assert_eq!(out.len(), 65534);
+        out.push(b'\n');
+        let head = r#"{"type":"response_item","payload":{"type":"function_call_output","output":""#;
+        let tail = r#""}}"#;
+        out.extend_from_slice(head.as_bytes());
+        out.extend(std::iter::repeat(b'x').take(327680 - head.len() - tail.len()));
+        out.extend_from_slice(tail.as_bytes());
+        out.push(b'\n');
+        assert_eq!(out.len(), 393216);
+        out
+    }
+
+    #[test]
+    fn oversized_record_at_a_block_edge_keeps_older_messages() {
+        let path = scratch_file("edge");
+        std::fs::write(&path, aligned_oversized_fixture()).unwrap();
+        let (meta, records) = select_native(&path).unwrap();
+        assert_eq!(meta["source_gap_stop"], false);
+        assert_eq!(meta["skipped_overlong_nonmessage"], 1);
+        assert_eq!(records.len(), 1, "{meta}");
+    }
+
+    #[test]
+    fn oversized_record_at_the_file_start_is_classified_from_byte_zero() {
+        let path = scratch_file("start");
+        let fixture = aligned_oversized_fixture();
+        std::fs::write(&path, &fixture[65535..]).unwrap();
+        let (meta, records) = select_native(&path).unwrap();
+        assert_eq!(meta["source_gap_stop"], false);
+        assert_eq!(meta["skipped_overlong_nonmessage"], 1);
+        assert!(records.is_empty(), "{meta}");
     }
 }

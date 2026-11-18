@@ -17,7 +17,8 @@ Run `cargo build --release` in this directory. Install the Rust command with `ca
 ## Style and behavior
 
 - Read only the requested suffix. Do not replace reverse scanning with a full-file read.
-- Emit only complete records in follow mode. Keep an unterminated suffix for the next poll and compare file IDs to detect rotation.
+- Emit only complete records in follow mode. Keep an unterminated suffix for the next poll, including the one already present when follow starts, and compare file IDs to detect rotation.
+- Classify an oversized record from its own first bytes, not from the scan segment that happens to hold them; a record can start in the last byte of a block.
 - Keep Python `tail()` on the shared Rust suffix reader. Preserve `native-history-tail.py` metadata keys and oldest-to-newest output order.
 - Demo records must be synthetic. Benchmarks may read a temporary copy of a real transcript, never its live source.
 - Do not publish to GitHub, PyPI or crates.io from this checkout.

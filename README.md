@@ -31,7 +31,7 @@ jlogtail transcript.jsonl --filter payload.role=assistant --fields timestamp,pay
 jlogtail transcript.jsonl --follow
 ```
 
-Claude Code, Codex, and Pi transcripts use the same JSONL commands. The CLI outputs original rows by default. `--fields` emits a compact object with selected dotted paths. `--filter PATH=VALUE` compares JSON values; unquoted non-JSON values are strings. A byte window skips a partial first record but keeps it when the window starts at a line boundary. Follow reads each appended byte once, keeps an incomplete row in memory, and emits it when the newline arrives.
+Claude Code, Codex, and Pi transcripts use the same JSONL commands. The CLI outputs original rows by default. `--fields` emits a compact object with selected dotted paths. `--filter PATH=VALUE` compares JSON values; unquoted non-JSON values are strings. A byte window skips a partial first record but keeps it when the window starts at a line boundary. Follow reads each appended byte once, keeps an incomplete row in memory, and emits it when the newline arrives. A row that is already unfinished when follow starts is kept from its first byte, so the first poll emits the whole row rather than a fragment.
 
 ```console
 $ jlogtail docs/demo/agents.jsonl --lines 2 --fields role,text
