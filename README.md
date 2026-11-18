@@ -1,7 +1,16 @@
+<img src="https://raw.githubusercontent.com/elfenomenokim/jlogtail/main/docs/logo.svg" width="96" height="96" alt="jlogtail: the last lines of a file, measured from the end">
+
 # jlogtail
 [한국어](README.ko.md)
 
 A Rust command-line tool and Python module that read the end of large JSON Lines transcripts without loading the whole file.
+
+Rust · Python 3.9+
+
+[![pypi](https://img.shields.io/pypi/v/jlogtail?label=pypi)](https://pypi.org/project/jlogtail/)
+[![license](https://img.shields.io/github/license/elfenomenokim/jlogtail)](https://github.com/elfenomenokim/jlogtail/blob/main/LICENSE)
+
+5.0 ms for the tail of a 2.18 GB transcript, against 66.5 ms for `tail | jq` and 1395.6 ms for a full Python read, from the saved 10-run file.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/elfenomenokim/jlogtail/main/docs/demo/dark.gif">
@@ -76,6 +85,10 @@ The Python module provides `jlogtail.tail(path, lines=20)` for raw complete rows
 ## Limits
 
 The benchmark and demo ran on macOS arm64. Linux and Windows builds have not been exercised. Follow compares platform file IDs and resets when it observes a shorter file. The benchmark ran on macOS arm64; Linux and Windows follow behavior has not been exercised. A filter requires valid JSON. A follow poll waits for the newline that completes each row.
+
+## Contributing
+
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the build, the fixture check and the review process.
 
 ## License
 

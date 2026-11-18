@@ -1,7 +1,16 @@
+<img src="https://raw.githubusercontent.com/elfenomenokim/jlogtail/main/docs/logo.svg" width="96" height="96" alt="파일 끝에서부터 마지막 줄만 읽는 모습을 나타낸 아이콘">
+
 # jlogtail
 [English](README.md)
 
 큰 JSON Lines 대화 기록에서 파일 전체를 메모리에 올리지 않고 끝부분을 읽는 Rust 명령줄 도구이자 Python 모듈입니다.
+
+Rust · Python 3.9+
+
+[![pypi](https://img.shields.io/pypi/v/jlogtail?label=pypi)](https://pypi.org/project/jlogtail/)
+[![license](https://img.shields.io/github/license/elfenomenokim/jlogtail)](https://github.com/elfenomenokim/jlogtail/blob/main/LICENSE)
+
+2.18GB 대화 기록의 끝을 읽는 데 5.0ms입니다. `tail | jq`는 66.5ms, Python으로 전체를 읽으면 1395.6ms입니다. 저장된 10회 측정에서 가져왔습니다.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/elfenomenokim/jlogtail/main/docs/demo/dark.gif">
@@ -77,6 +86,10 @@ Python 모듈의 `jlogtail.tail(path, lines=20)`은 완성된 원본 행을 반�
 
 macOS arm64에서 빌드와 예시를 확인했습니다. Linux와 Windows 빌드는 아직 실행하지 않았습니다. follow는 플랫폼 파일 ID를 비교하고 파일 크기가 줄어든 것을 확인하면 위치를 초기화합니다. 성능 측정은 macOS arm64에서만 했으며, Linux와 Windows의 follow 동작은 실행하지 않았습니다. 필터는 올바른 JSON 행이 필요합니다. follow는 각 행의 줄바꿈이 기록될 때까지 기다립니다.
 
+## 기여
+
+이슈와 풀 리퀘스트를 환영합니다. 빌드, 픽스처 확인, 리뷰 방식은 [CONTRIBUTING.md](CONTRIBUTING.md)에 있습니다.
+
 ## 라이선스
 
-MIT. 자세한 내용은 [LICENSE](LICENSE)를 참조하세요.
+MIT입니다. [LICENSE](LICENSE)를 보세요.

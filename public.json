@@ -51,6 +51,15 @@
     "docs/diagrams/tail-flow.ko.mmd",
     "docs/social.png",
     "docs/social.json",
-    ".github/workflows/claude.yml"
+    ".github/workflows/claude.yml",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "CODE_OF_CONDUCT.md",
+    "CHANGELOG.md",
+    ".github/ISSUE_TEMPLATE/bug_report.yml",
+    ".github/ISSUE_TEMPLATE/feature_request.yml",
+    ".github/ISSUE_TEMPLATE/config.yml",
+    ".github/pull_request_template.md",
+    "docs/logo.svg"
   ]
 }
