@@ -50,6 +50,7 @@
     "docs/diagrams/tail-flow.ko.light.svg",
     "docs/diagrams/tail-flow.ko.mmd",
     "docs/social.png",
-    "docs/social.json"
+    "docs/social.json",
+    ".github/workflows/claude.yml"
   ]
 }
