@@ -15,20 +15,20 @@ Fixes and reports are welcome. You do not need to ask before opening a pull requ
 ```sh
 git clone https://github.com/elfenomenokim/jlogtail
 cd jlogtail
+cargo test -j 1
 cargo build --release
 ./target/release/jlogtail docs/demo/agents.jsonl --lines 2 --fields role,text
 ```
 
-There is no separate test runner. The check is the real output: run the command against a small
-synthetic file under `docs/demo/`, and compare it with the records you expect. The Python module is
+Run `cargo test -j 1` and verify the CLI output against a synthetic file under `docs/demo/`. The Python module is
 built by maturin; `python3 -m pip wheel --no-deps --wheel-dir target/wheels .` after the Rust
 build passes.
 
 ## Rules a patch must keep
 
-- Read only the requested suffix. A full-file read is not an acceptable implementation of a tail.
+- Read only the requested suffix within `max_bytes`. A full-file or unbounded read is not an acceptable implementation of a tail.
 - Emit complete records only. A row that starts inside a byte window is skipped, and a follow poll
-  keeps an unterminated row until the newline arrives.
+  keeps an unterminated row up to `max_bytes` until the newline arrives (oversized records are skipped with a clear marker).
 - Classify an oversized record from its own first bytes, not from the scan block that happens to
   hold them.
 - Keep the Python `tail()` on the shared Rust reader, so both editions agree.

@@ -3,6 +3,26 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses `MAJOR.MINOR.PATCH`.
 
+## [0.2.0] - 2026-11-19
+
+### Added
+
+- Caller-set memory ceiling across `read_tail_bounded`, `--max-bytes` (default 64 MiB), follow-mode
+  appended reads, and incomplete trailing-record buffering.
+- `jlogtail.tail(..., max_bytes=DEFAULT_MAX_BYTES, keep_partial_first=False)` and
+  `jlogtail.tail_window(...)` returning `(meta, rows)` with `end_offset`, `max_bytes`,
+  `skipped_oversized`, `ceiling_reached`, and `trailing_oversized`.
+- Clear markers when a record exceeds the ceiling or caps the window: `stderr` diagnostics in the
+  CLI, `RuntimeWarning` in Python `tail()`, and explicit fields on `TailWindow`.
+- `--version` / `-V` CLI flag matching `SECURITY.md`.
+
+### Changed
+
+- `read_tail` and Python `tail()` enforce the safe 64 MiB default ceiling (`DEFAULT_MAX_BYTES`)
+  instead of unbounded `read_to_end` and backward scans.
+- Follow mode reads appended bytes in bounded chunks and discards oversized records until the next
+  newline instead of growing `pending` without limit.
+
 ## [0.1.2] - 2026-11-18
 
 ### Fixed

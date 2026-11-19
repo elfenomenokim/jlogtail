@@ -48,7 +48,7 @@ jlogtail transcript.jsonl --filter payload.role=assistant --fields timestamp,pay
 jlogtail transcript.jsonl --follow
 ```
 
-Claude Code, Codex, and Pi transcripts use the same JSONL commands. The CLI outputs original rows by default. `--fields` emits a compact object with selected dotted paths. `--filter PATH=VALUE` compares JSON values; unquoted non-JSON values are strings. A byte window skips a partial first record but keeps it when the window starts at a line boundary. Follow reads each appended byte once, keeps an incomplete row in memory, and emits it when the newline arrives. A row that is already unfinished when follow starts is kept from its first byte, so the first poll emits the whole row rather than a fragment.
+Claude Code, Codex, and Pi transcripts use the same JSONL commands. The CLI outputs original rows by default. `--fields` emits a compact object with selected dotted paths. `--filter PATH=VALUE` compares JSON values; unquoted non-JSON values are strings. A byte window skips a partial first record but keeps it when the window starts at a line boundary. Every read path—initial `read_tail`, appended `--follow` reads, and incomplete trailing-record buffering—enforces `--max-bytes` (default 64 MiB). When a record exceeds `--max-bytes`, `jlogtail` skips it and prints a marker to `stderr` instead of growing an unbounded buffer. A row that is already unfinished when follow starts is kept from its first byte when within `--max-bytes`, so the first poll emits the whole row rather than a fragment.
 
 ```console
 $ jlogtail docs/demo/agents.jsonl --lines 2 --fields role,text
@@ -86,13 +86,15 @@ On M5 Pro, macOS arm64, hyperfine ran 3 warmups and 10 measured runs per command
 | `--filter PATH=VALUE` | Keep rows whose dotted key path equals the JSON value |
 | `--fields PATH,...` | Emit only the selected dotted paths as a compact object |
 | `--poll-ms N` | Follow poll interval; default 250 ms |
+| `--max-bytes N` | Memory ceiling in bytes for `read_tail`, follow reads, and pending incomplete records; default 67108864 (64 MiB) |
 | `--keep-partial-first` | Keep the first partial row in a byte window |
+| `--version`, `-V` | Print the `jlogtail` version and exit |
 
-The Python module provides `jlogtail.tail(path, lines=20)` for raw complete rows; use `byte_window=N` to choose a suffix by bytes. `jlogtail.select_native(path)` returns a metadata dictionary and oldest-to-newest Codex message objects. `lib/native-history-tail.py` preserves feno-handoff's existing one-path command and metadata output.
+The Python module provides `jlogtail.tail(path, lines=10, byte_window=None, max_bytes=jlogtail.DEFAULT_MAX_BYTES, keep_partial_first=False)` for raw complete rows (emitting a `RuntimeWarning` if a record is skipped or the window hits `max_bytes`). `jlogtail.tail_window(...)` returns `(meta, rows)` with `end_offset`, `max_bytes`, `skipped_oversized`, `ceiling_reached`, and `trailing_oversized`. `jlogtail.select_native(path)` returns a metadata dictionary and oldest-to-newest Codex message objects. `lib/native-history-tail.py` preserves feno-handoff's existing one-path command and metadata output.
 
 ## Limits
 
-The benchmark and demo ran on macOS arm64. Linux and Windows builds have not been exercised. Follow compares platform file IDs and resets when it observes a shorter file. The benchmark ran on macOS arm64; Linux and Windows follow behavior has not been exercised. A filter requires valid JSON. A follow poll waits for the newline that completes each row.
+The benchmark and demo ran on macOS arm64. Linux and Windows builds have not been exercised. Follow compares platform file IDs and resets when it observes a shorter file. The benchmark ran on macOS arm64; Linux and Windows follow behavior has not been exercised. A filter requires valid JSON. A follow poll waits for the newline that completes each row. Records larger than `--max-bytes` (default 64 MiB) are skipped with a clear `stderr` marker (or Python `RuntimeWarning` and metadata count) rather than buffering past the ceiling.
 
 ## Contributing
 

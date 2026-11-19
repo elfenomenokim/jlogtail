@@ -7,122 +7,242 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 pub const SCAN_CAP: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const RECORD_CAP: usize = 256 * 1024;
-const CHUNK: usize = 64 * 1024;
+pub(crate) const CHUNK: usize = 64 * 1024;
 
 pub fn run_cli(args: Vec<String>) -> Result<(), String> {
     cli::run(args)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TailWindow {
     pub bytes: Vec<u8>,
     pub end_offset: u64,
+    pub skipped_oversized: usize,
+    pub ceiling_reached: bool,
+    pub trailing_oversized: bool,
 }
 
-/// Read a bounded suffix, dropping a partial first byte-window row and any incomplete final row.
+/// Read a bounded suffix using `DEFAULT_MAX_BYTES`, dropping a partial first byte-window row and any incomplete final row.
 pub fn read_tail(
     path: &Path,
     lines: Option<usize>,
     byte_window: Option<u64>,
     keep_partial_first: bool,
 ) -> std::io::Result<TailWindow> {
+    read_tail_bounded(path, lines, byte_window, keep_partial_first, DEFAULT_MAX_BYTES)
+}
+
+/// Read a suffix bounded by `max_bytes`, dropping a partial first row and any incomplete final row.
+///
+/// Records larger than `max_bytes` are skipped instead of growing an unbounded buffer.
+pub fn read_tail_bounded(
+    path: &Path,
+    lines: Option<usize>,
+    byte_window: Option<u64>,
+    keep_partial_first: bool,
+    max_bytes: usize,
+) -> std::io::Result<TailWindow> {
+    if max_bytes == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "max_bytes must be greater than 0",
+        ));
+    }
+    let cap = max_bytes as u64;
     let mut file = File::open(path)?;
     let size = file.metadata()?.len();
-    let mut start = if let Some(bytes) = byte_window {
-        size.saturating_sub(bytes)
-    } else {
-        0
-    };
-    if byte_window.is_none() {
-        let n = lines.unwrap_or(10);
-        let mut logical_end = size;
-        let mut has_final_newline = false;
-        // First byte of the record still being written when the file ends mid-line.
-        let mut trailing_start = size;
-        if size > 0 {
-            file.seek(SeekFrom::Start(size - 1))?;
-            let mut last = [0u8; 1];
-            file.read_exact(&mut last)?;
-            has_final_newline = last[0] == b'\n';
-            if !has_final_newline {
-                let mut scan = size;
-                let mut found = None;
-                let mut block = [0u8; CHUNK];
-                while scan > 0 && found.is_none() {
-                    let amount = scan.min(block.len() as u64) as usize;
-                    scan -= amount as u64;
-                    file.seek(SeekFrom::Start(scan))?;
-                    file.read_exact(&mut block[..amount])?;
-                    if let Some(i) = block[..amount].iter().rposition(|b| *b == b'\n') {
-                        found = Some(scan + i as u64);
-                    }
-                }
-                match found {
-                    Some(i) => {
-                        logical_end = i;
-                        trailing_start = i + 1;
-                    }
-                    None => {
-                        logical_end = 0;
-                        trailing_start = 0;
-                    }
-                }
+    if size == 0 {
+        return Ok(TailWindow {
+            bytes: Vec::new(),
+            end_offset: 0,
+            skipped_oversized: 0,
+            ceiling_reached: false,
+            trailing_oversized: false,
+        });
+    }
+
+    if let Some(bytes) = byte_window {
+        let effective_bytes = bytes.min(cap);
+        let window_capped = bytes > cap && size > cap;
+        let mut start = size.saturating_sub(effective_bytes);
+        let mut starts_on_boundary = start == 0;
+        if start > 0 && !keep_partial_first {
+            file.seek(SeekFrom::Start(start - 1))?;
+            let mut previous = [0u8; 1];
+            file.read_exact(&mut previous)?;
+            starts_on_boundary = previous[0] == b'\n';
+        }
+        file.seek(SeekFrom::Start(start))?;
+        let mut data = Vec::new();
+        file.by_ref().take(effective_bytes).read_to_end(&mut data)?;
+        let read_len = data.len() as u64;
+        let had_newline = data.iter().any(|b| *b == b'\n');
+
+        if !had_newline && start > 0 && bytes >= cap {
+            return Ok(TailWindow {
+                bytes: Vec::new(),
+                end_offset: start + read_len,
+                skipped_oversized: 1,
+                ceiling_reached: true,
+                trailing_oversized: true,
+            });
+        }
+
+        if start > 0 && !keep_partial_first && !starts_on_boundary {
+            if let Some(nl) = data.iter().position(|b| *b == b'\n') {
+                data.drain(..=nl);
+                start += (nl + 1) as u64;
+            } else {
+                start += data.len() as u64;
+                data.clear();
             }
         }
-        let mut pos = logical_end;
-        let mut count = 0usize;
+        let complete = data.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        data.truncate(complete);
+        let skipped_oversized = usize::from(
+            window_capped && had_newline && data.is_empty() && !keep_partial_first,
+        );
+        return Ok(TailWindow {
+            bytes: data,
+            end_offset: start + complete as u64,
+            skipped_oversized,
+            ceiling_reached: window_capped,
+            trailing_oversized: false,
+        });
+    }
+
+    let n = lines.unwrap_or(10);
+    let mut logical_end = size;
+    let mut trailing_start = size;
+
+    file.seek(SeekFrom::Start(size - 1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    let has_final_newline = last[0] == b'\n';
+
+    if !has_final_newline {
+        let min_scan = size.saturating_sub(cap.saturating_add(1));
+        let mut scan = size;
+        let mut found = None;
         let mut block = [0u8; CHUNK];
-        if has_final_newline && pos > 0 {
-            pos -= 1;
-        }
-        while pos > 0 && count < n {
-            let amount = pos.min(block.len() as u64) as usize;
-            pos -= amount as u64;
-            file.seek(SeekFrom::Start(pos))?;
+        while scan > min_scan && found.is_none() {
+            let amount = (scan - min_scan).min(block.len() as u64) as usize;
+            scan -= amount as u64;
+            file.seek(SeekFrom::Start(scan))?;
             file.read_exact(&mut block[..amount])?;
-            for i in (0..amount).rev() {
-                if block[i] == b'\n' {
-                    count += 1;
-                    if count == n {
-                        start = pos + i as u64 + 1;
-                        break;
-                    }
-                }
-            }
-            if count == n {
-                break;
+            if let Some(i) = block[..amount].iter().rposition(|b| *b == b'\n') {
+                found = Some(scan + i as u64);
             }
         }
-        if n == 0 || logical_end == 0 {
-            // Resume at the first byte of an unterminated final record, not at
-            // EOF: follow must emit that record whole once its newline arrives.
-            start = trailing_start;
+        match found {
+            Some(i) => {
+                logical_end = i;
+                trailing_start = i + 1;
+            }
+            None => {
+                if min_scan > 0 || size > cap {
+                    return Ok(TailWindow {
+                        bytes: Vec::new(),
+                        end_offset: size,
+                        skipped_oversized: 1,
+                        ceiling_reached: true,
+                        trailing_oversized: true,
+                    });
+                }
+                logical_end = 0;
+                trailing_start = 0;
+            }
         }
     }
+
+    if n == 0 || logical_end == 0 {
+        return Ok(TailWindow {
+            bytes: Vec::new(),
+            end_offset: trailing_start,
+            skipped_oversized: 0,
+            ceiling_reached: false,
+            trailing_oversized: false,
+        });
+    }
+
+    let complete_end = if has_final_newline {
+        size
+    } else {
+        logical_end + 1
+    };
+    let min_start = complete_end.saturating_sub(cap);
+    let mut pos = logical_end;
+    let mut count = 0usize;
+    let mut block = [0u8; CHUNK];
+    if has_final_newline && pos > 0 {
+        pos -= 1;
+    }
+    let mut start = min_start;
+    while pos > min_start && count < n {
+        let amount = (pos - min_start).min(block.len() as u64) as usize;
+        pos -= amount as u64;
+        file.seek(SeekFrom::Start(pos))?;
+        file.read_exact(&mut block[..amount])?;
+        for i in (0..amount).rev() {
+            if block[i] == b'\n' {
+                count += 1;
+                if count == n {
+                    start = pos + i as u64 + 1;
+                    break;
+                }
+            }
+        }
+        if count == n {
+            break;
+        }
+    }
+
     let mut starts_on_boundary = start == 0;
-    if start > 0 && byte_window.is_some() && !keep_partial_first {
+    if start > 0 && count < n {
         file.seek(SeekFrom::Start(start - 1))?;
         let mut previous = [0u8; 1];
         file.read_exact(&mut previous)?;
         starts_on_boundary = previous[0] == b'\n';
+    } else if count == n {
+        starts_on_boundary = true;
     }
+
+    let read_len = complete_end - start;
     file.seek(SeekFrom::Start(start))?;
     let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
-    if start > 0 && byte_window.is_some() && !keep_partial_first && !starts_on_boundary {
-        if let Some(nl) = data.iter().position(|b| *b == b'\n') {
-            data.drain(..=nl);
-            start += (nl + 1) as u64;
-        } else {
-            start += data.len() as u64;
-            data.clear();
+    file.by_ref().take(read_len).read_to_end(&mut data)?;
+
+    let mut ceiling_reached = false;
+    let mut skipped_oversized = 0usize;
+    if count < n && min_start > 0 {
+        if !(starts_on_boundary && count + 1 == n) {
+            ceiling_reached = true;
+        }
+        if !starts_on_boundary {
+            if let Some(nl) = data.iter().position(|b| *b == b'\n') {
+                data.drain(..=nl);
+                start += (nl + 1) as u64;
+            } else {
+                start += data.len() as u64;
+                data.clear();
+            }
+            if data.is_empty() {
+                skipped_oversized = 1;
+            }
         }
     }
+
     let complete = data.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
     data.truncate(complete);
+
     Ok(TailWindow {
         bytes: data,
-        end_offset: start + complete as u64,
+        end_offset: trailing_start.max(start + complete as u64),
+        skipped_oversized,
+        ceiling_reached,
+        trailing_oversized: false,
     })
 }
 
@@ -502,12 +622,8 @@ fn select_native_py(path: &str) -> PyResult<(String, Vec<String>)> {
 }
 
 #[cfg(feature = "extension-module")]
-#[pyfunction(signature = (path, lines=None, byte_window=None))]
-fn tail_raw(path: &str, lines: Option<usize>, byte_window: Option<u64>) -> PyResult<Vec<String>> {
-    let window = read_tail(Path::new(path), lines, byte_window, false)
-        .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
-    window
-        .bytes
+fn split_rows(bytes: &[u8]) -> PyResult<Vec<String>> {
+    bytes
         .split(|b| *b == b'\n')
         .filter(|line| !line.is_empty())
         .map(|line| {
@@ -515,6 +631,56 @@ fn tail_raw(path: &str, lines: Option<usize>, byte_window: Option<u64>) -> PyRes
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
         })
         .collect()
+}
+
+#[cfg(feature = "extension-module")]
+fn map_tail_io_err(err: std::io::Error) -> PyErr {
+    match err.kind() {
+        std::io::ErrorKind::InvalidInput => {
+            pyo3::exceptions::PyValueError::new_err(err.to_string())
+        }
+        _ => pyo3::exceptions::PyOSError::new_err(err.to_string()),
+    }
+}
+
+#[cfg(feature = "extension-module")]
+#[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false))]
+fn tail_raw(
+    path: &str,
+    lines: Option<usize>,
+    byte_window: Option<u64>,
+    max_bytes: Option<usize>,
+    keep_partial_first: bool,
+) -> PyResult<Vec<String>> {
+    let limit = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+    let window = read_tail_bounded(Path::new(path), lines, byte_window, keep_partial_first, limit)
+        .map_err(map_tail_io_err)?;
+    split_rows(&window.bytes)
+}
+
+#[cfg(feature = "extension-module")]
+#[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false))]
+fn tail_window_raw(
+    path: &str,
+    lines: Option<usize>,
+    byte_window: Option<u64>,
+    max_bytes: Option<usize>,
+    keep_partial_first: bool,
+) -> PyResult<(String, Vec<String>)> {
+    let limit = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+    let window = read_tail_bounded(Path::new(path), lines, byte_window, keep_partial_first, limit)
+        .map_err(map_tail_io_err)?;
+    let meta = json!({
+        "end_offset": window.end_offset,
+        "max_bytes": limit,
+        "skipped_oversized": window.skipped_oversized,
+        "ceiling_reached": window.ceiling_reached,
+        "trailing_oversized": window.trailing_oversized,
+    });
+    let meta_json = serde_json::to_string(&meta)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let rows = split_rows(&window.bytes)?;
+    Ok((meta_json, rows))
 }
 
 #[cfg(feature = "extension-module")]
@@ -533,8 +699,10 @@ fn cli_entry(py: Python<'_>) -> PyResult<()> {
 #[cfg(feature = "extension-module")]
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("DEFAULT_MAX_BYTES", DEFAULT_MAX_BYTES)?;
     m.add_function(wrap_pyfunction!(select_native_py, m)?)?;
     m.add_function(wrap_pyfunction!(tail_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(tail_window_raw, m)?)?;
     m.add_function(wrap_pyfunction!(cli_entry, m)?)?;
     Ok(())
 }
@@ -659,5 +827,72 @@ mod tests {
         assert_eq!(meta["source_gap_stop"], false);
         assert_eq!(meta["skipped_overlong_nonmessage"], 1);
         assert!(records.is_empty(), "{meta}");
+    }
+
+    #[test]
+    fn read_tail_bounded_rejects_zero_ceiling() {
+        let path = scratch_file("zero-cap");
+        std::fs::write(&path, b"{\"a\":1}\n").unwrap();
+        let err = read_tail_bounded(&path, Some(1), None, false, 0).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn read_tail_bounded_caps_lines_window_at_max_bytes() {
+        let path = scratch_file("lines-cap");
+        let row = "{\"msg\":\"0123456789\"}\n";
+        let content = row.repeat(20);
+        std::fs::write(&path, content.as_bytes()).unwrap();
+        let window = read_tail_bounded(&path, Some(20), None, false, 50).unwrap();
+        assert!(window.ceiling_reached);
+        assert_eq!(window.skipped_oversized, 0);
+        assert!(!window.trailing_oversized);
+        assert!(window.bytes.len() <= 50);
+        assert_eq!(window.bytes, row.repeat(2).as_bytes());
+        assert_eq!(window.end_offset, content.len() as u64);
+    }
+
+    #[test]
+    fn read_tail_bounded_skips_oversized_complete_record() {
+        let path = scratch_file("oversized-complete");
+        let small = b"{\"ok\":1}\n";
+        let mut content = small.to_vec();
+        content.extend_from_slice(format!("{{\"big\":\"{}\"}}\n", "x".repeat(200)).as_bytes());
+        std::fs::write(&path, &content).unwrap();
+        let window = read_tail_bounded(&path, Some(10), None, false, 64).unwrap();
+        assert!(window.bytes.is_empty());
+        assert!(window.ceiling_reached);
+        assert_eq!(window.skipped_oversized, 1);
+        assert!(!window.trailing_oversized);
+        assert_eq!(window.end_offset, content.len() as u64);
+    }
+
+    #[test]
+    fn read_tail_bounded_skips_oversized_incomplete_trailing_record() {
+        let path = scratch_file("oversized-trailing");
+        let mut content = b"{\"ok\":1}\n".to_vec();
+        content.extend_from_slice(format!("{{\"big\":\"{}", "x".repeat(200)).as_bytes());
+        std::fs::write(&path, &content).unwrap();
+        let window = read_tail_bounded(&path, Some(10), None, false, 64).unwrap();
+        assert!(window.bytes.is_empty());
+        assert!(window.ceiling_reached);
+        assert_eq!(window.skipped_oversized, 1);
+        assert!(window.trailing_oversized);
+        assert_eq!(window.end_offset, content.len() as u64);
+    }
+
+    #[test]
+    fn read_tail_bounded_caps_byte_window_and_drops_partial_first() {
+        let path = scratch_file("bytes-cap");
+        let r1 = b"{\"id\":1,\"pad\":\"aaaaaaaaaa\"}\n";
+        let r2 = b"{\"id\":2}\n";
+        let mut content = Vec::new();
+        content.extend_from_slice(r1);
+        content.extend_from_slice(r2);
+        std::fs::write(&path, &content).unwrap();
+        let window = read_tail_bounded(&path, None, Some(1000), false, 20).unwrap();
+        assert!(window.ceiling_reached);
+        assert_eq!(window.bytes, r2);
+        assert_eq!(window.end_offset, content.len() as u64);
     }
 }

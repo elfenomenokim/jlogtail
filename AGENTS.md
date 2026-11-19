@@ -19,6 +19,7 @@ Run `cargo build --release` in this directory. Install the Rust command with `ca
 - Read only the requested suffix. Do not replace reverse scanning with a full-file read.
 - Emit only complete records in follow mode. Keep an unterminated suffix for the next poll, including the one already present when follow starts, and compare file IDs to detect rotation.
 - Classify an oversized record from its own first bytes, not from the scan segment that happens to hold them; a record can start in the last byte of a block.
+- Enforce the `max_bytes` ceiling (`DEFAULT_MAX_BYTES`, 64 MiB) across `read_tail` / `read_tail_bounded`, follow-mode chunk reads, and incomplete-record buffering; skip oversized records with a clear marker instead of growing an unbounded buffer.
 - Keep Python `tail()` on the shared Rust suffix reader. Preserve `native-history-tail.py` metadata keys and oldest-to-newest output order.
 - Demo records must be synthetic. Benchmarks may read a temporary copy of a real transcript, never its live source.
 - Do not publish to GitHub, PyPI or crates.io from this checkout.
@@ -29,7 +30,7 @@ Run `cargo build --release` in this directory. Install the Rust command with `ca
 
 ## Checks
 
-Build the Rust CLI with `cargo build --release`. Inspect the actual output with a small synthetic JSONL fixture. The public package has not been released.
+Run `cargo test -j 1` and `cargo build --release` in this directory. Inspect the actual output with a small synthetic JSONL fixture under `docs/demo/`.
 
 ## Code Review Rules
 

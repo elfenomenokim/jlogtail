@@ -48,7 +48,7 @@ jlogtail transcript.jsonl --filter payload.role=assistant --fields timestamp,pay
 jlogtail transcript.jsonl --follow
 ```
 
-Claude Code, Codex, Pi 대화 기록에 같은 명령을 쓸 수 있습니다. CLI는 기본적으로 원래 JSONL 행을 출력합니다. `--fields`는 선택한 점 경로만 간결한 객체로 출력합니다. `--filter PATH=VALUE`는 JSON 값과 비교하며, JSON 문법이 아닌 값은 문자열로 처리합니다. 바이트 창은 첫 행이 잘린 경우에만 건너뜁니다. `--follow`는 추가된 바이트를 한 번씩 읽고, 끝이 잘린 행을 메모리에 보관했다가 줄바꿈이 오면 출력합니다. follow를 시작할 때 이미 끝나지 않은 행이 있으면 첫 바이트부터 보관하므로, 첫 확인에서 조각이 아니라 완성된 행을 출력합니다.
+Claude Code, Codex, Pi 대화 기록에 같은 명령을 쓸 수 있습니다. CLI는 기본적으로 원래 JSONL 행을 출력합니다. `--fields`는 선택한 점 경로만 간결한 객체로 출력합니다. `--filter PATH=VALUE`는 JSON 값과 비교하며, JSON 문법이 아닌 값은 문자열로 처리합니다. 바이트 창은 첫 행이 잘린 경우에만 건너뜁니다. 초기 `read_tail`, `--follow` 추가 읽기, 끝나지 않은 마지막 행 버퍼링 모두 `--max-bytes`(기본 64 MiB) 상한을 지킵니다. 상한을 넘는 행은 버퍼를 무한정 키우지 않고 건너뛴 뒤 `stderr`에 알림을 남깁니다. follow를 시작할 때 이미 끝나지 않은 행이 있으면 `--max-bytes` 안에서 첫 바이트부터 보관해, 첫 확인에서 조각이 아니라 완성된 행을 출력합니다.
 
 ```console
 $ jlogtail docs/demo/agents.jsonl --lines 2 --fields role,text
@@ -86,13 +86,15 @@ M5 Pro macOS arm64에서 hyperfine으로 명령마다 예열 3회와 측정 10�
 | `--filter PATH=VALUE` | 점으로 구분한 경로의 값이 일치하는 행만 남깁니다. |
 | `--fields PATH,...` | 선택한 경로만 간결한 객체로 출력합니다. |
 | `--poll-ms N` | follow 확인 간격입니다. 기본값은 250ms입니다. |
+| `--max-bytes N` | `read_tail`, follow 추가 읽기, 미완성 행 버퍼의 메모리 상한(바이트)입니다. 기본값은 67108864(64 MiB)입니다. |
 | `--keep-partial-first` | 바이트 창에서 첫 행의 일부도 유지합니다. |
+| `--version`, `-V` | `jlogtail` 버전을 출력하고 종료합니다. |
 
-Python 모듈의 `jlogtail.tail(path, lines=20)`은 완성된 원본 행을 반환합니다. `byte_window=N`으로 바이트 창을 지정할 수도 있습니다. `jlogtail.select_native(path)`는 메타데이터 사전과 오래된 순서의 최근 Codex 메시지 객체를 반환합니다. `lib/native-history-tail.py`는 기존 feno-handoff의 단일 경로 인자와 메타데이터 출력을 유지합니다.
+Python 모듈의 `jlogtail.tail(path, lines=10, byte_window=None, max_bytes=jlogtail.DEFAULT_MAX_BYTES, keep_partial_first=False)`는 완성된 원본 행을 반환하며, 상한 초과로 행을 건너뛰거나 창이 잘리면 `RuntimeWarning`을 발생시킵니다. `jlogtail.tail_window(...)`는 `end_offset`, `max_bytes`, `skipped_oversized`, `ceiling_reached`, `trailing_oversized`가 담긴 메타데이터 사전과 행 목록을 함께 반환합니다. `jlogtail.select_native(path)`는 메타데이터 사전과 오래된 순서의 최근 Codex 메시지 객체를 반환합니다. `lib/native-history-tail.py`는 기존 feno-handoff의 단일 경로 인자와 메타데이터 출력을 유지합니다.
 
 ## 제한
 
-macOS arm64에서 빌드와 예시를 확인했습니다. Linux와 Windows 빌드는 아직 실행하지 않았습니다. follow는 플랫폼 파일 ID를 비교하고 파일 크기가 줄어든 것을 확인하면 위치를 초기화합니다. 성능 측정은 macOS arm64에서만 했으며, Linux와 Windows의 follow 동작은 실행하지 않았습니다. 필터는 올바른 JSON 행이 필요합니다. follow는 각 행의 줄바꿈이 기록될 때까지 기다립니다.
+macOS arm64에서 빌드와 예시를 확인했습니다. Linux와 Windows 빌드는 아직 실행하지 않았습니다. follow는 플랫폼 파일 ID를 비교하고 파일 크기가 줄어든 것을 확인하면 위치를 초기화합니다. 성능 측정은 macOS arm64에서만 했으며, Linux와 Windows의 follow 동작은 실행하지 않았습니다. 필터는 올바른 JSON 행이 필요합니다. follow는 각 행의 줄바꿈이 기록될 때까지 기다립니다. `--max-bytes`(기본 64 MiB)를 넘는 행은 무제한으로 버퍼링하지 않고 건너뛴 뒤 `stderr` 경고(Python에서는 `RuntimeWarning` 및 메타데이터)로 알립니다.
 
 ## 기여
 
