@@ -37,8 +37,9 @@ build passes.
 
 - **A fixture that shows the bug**, and the same command passing after the fix.
 - **A line under Unreleased** in [CHANGELOG.md](CHANGELOG.md) when a user will notice.
-- **The platforms you did not test** written in the pull request. The benchmark and demo ran on
-  macOS arm64; Linux and Windows follow behaviour has not been exercised.
+- **The platforms you did not test** written in the pull request. The `tests` workflow runs `cargo test`
+  and the demo CLI check on Ubuntu, macOS and Windows; live Linux and Windows follow behaviour beyond
+  the unit tests has not been exercised.
 
 ## Review
 

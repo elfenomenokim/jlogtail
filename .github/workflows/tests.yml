@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test and build Rust CLI
+        run: |
+          # PyO3 wheel builds run in wheels.yml; live follow-mode file rotation on Linux/Windows
+          # beyond unit tests is left out of CI.
+          cargo test --locked -j 1
+          cargo build --release --locked
+          cargo run --release --locked -- docs/demo/agents.jsonl --lines 2 --fields role,text
+      - name: Compile Python wrapper
+        run: python -m compileall -q python
