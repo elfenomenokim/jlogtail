@@ -3,6 +3,28 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses `MAJOR.MINOR.PATCH`.
 
+## [0.3.1] - 2026-11-23
+
+### Added
+
+- `raw=True` option on `jlogtail.tail(...)`, `jlogtail.tail_window(...)` and
+  `jlogtail.read_forward(...)`: each row comes back as a `bytes` object holding the row
+  exactly as stored in the file, without its trailing `\n`. No UTF-8 decode happens, so
+  invalid bytes pass through unchanged and `errors` is ignored; row selection (partial
+  first row, incomplete final row, `end=`, `max_bytes`, oversized skip, metadata offsets)
+  is identical to the default `str` rows. Defaults are unchanged: `raw=False` keeps the
+  0.3.0 behavior.
+
+### Performance
+
+- Hot read paths (`read_tail_bounded` byte_window and lines modes, `read_forward`,
+  `decode_rows`, `row_bytes`) preallocate their read buffer and find newlines with the
+  `memchr` crate instead of per-byte loops, and window trimming slices instead of
+  draining, so the partial first row no longer memmoves the window. Measured on a 380 MB
+  transcript (M5, 50-run mean, `end=size`): `tail_window_raw(raw=True)` 2 MiB window
+  0.90 ms -> 0.15 ms, 256 KiB 0.13 ms -> 0.04 ms; `lines=200` 1.15 ms -> 0.21 ms.
+  Selection rules and metadata are byte-identical.
+
 ## [0.3.0] - 2026-11-23
 
 ### Added

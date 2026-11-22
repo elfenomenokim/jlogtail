@@ -18,6 +18,7 @@ def tail(
     keep_partial_first=False,
     errors="strict",
     end=None,
+    raw=False,
 ):
     """Return raw, complete JSONL rows from the last line or byte window.
 
@@ -25,9 +26,12 @@ def tail(
     ``end`` treats the file as if it ended at that byte offset: the final row must end
     with a newline at ``end - 1`` (otherwise it is dropped like a trailing partial row),
     and ``end`` beyond the file size raises ``ValueError``.
+    ``raw=True`` returns each row as ``bytes`` exactly as stored in the file, without
+    its trailing newline and without UTF-8 decoding, so invalid bytes pass through
+    unchanged; ``errors`` is then ignored.
     """
     meta_json, rows = _tail_window_raw(
-        os.fspath(path), lines, byte_window, max_bytes, keep_partial_first, errors, end
+        os.fspath(path), lines, byte_window, max_bytes, keep_partial_first, errors, end, raw
     )
     meta = json.loads(meta_json)
     if meta["skipped_oversized"]:
@@ -54,20 +58,21 @@ def tail_window(
     keep_partial_first=False,
     errors="strict",
     end=None,
+    raw=False,
 ):
     """Return bounded tail metadata and raw, complete JSONL rows. ``errors`` as in ``tail``.
 
     ``meta`` carries ``start_offset`` (the byte offset of the first returned row,
     equal to ``end_offset`` when no rows) so a reverse scan can continue with
-    ``end=meta["start_offset"]``.
+    ``end=meta["start_offset"]``. ``raw=True`` returns ``bytes`` rows as in ``tail``.
     """
     meta_json, rows = _tail_window_raw(
-        os.fspath(path), lines, byte_window, max_bytes, keep_partial_first, errors, end
+        os.fspath(path), lines, byte_window, max_bytes, keep_partial_first, errors, end, raw
     )
     return json.loads(meta_json), rows
 
 
-def read_forward(path, *, offset=0, max_bytes=DEFAULT_MAX_BYTES, errors="strict"):
+def read_forward(path, *, offset=0, max_bytes=DEFAULT_MAX_BYTES, errors="strict", raw=False):
     """Read complete rows forward from a saved byte offset under snapshot identity.
 
     ``offset`` is a cursor from a previous call's ``meta["new_offset"]``; 0 reads
@@ -77,9 +82,10 @@ def read_forward(path, *, offset=0, max_bytes=DEFAULT_MAX_BYTES, errors="strict"
     ``new_offset`` is the unchanged start offset (0 when the file no longer
     reaches the saved offset), so the caller rescans instead of guessing. An
     unterminated trailing row is held: the cursor stops before it, and a later
-    call returns it once the writer finishes it. ``errors`` is as in ``tail``.
+    call returns it once the writer finishes it. ``errors`` is as in ``tail`` and
+    is ignored with ``raw=True``.
     """
-    meta_json, rows = _read_forward_raw(os.fspath(path), offset, max_bytes, errors)
+    meta_json, rows = _read_forward_raw(os.fspath(path), offset, max_bytes, errors, raw)
     return json.loads(meta_json), rows
 
 

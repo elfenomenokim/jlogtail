@@ -25,6 +25,7 @@
     "python/jlogtail/__init__.py",
     "python/jlogtail/cli.py",
     "python/tests/test_end.py",
+    "python/tests/test_raw.py",
     "src/cli.rs",
     "src/lib.rs",
     "src/main.rs",

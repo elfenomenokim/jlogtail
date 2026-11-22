@@ -33,13 +33,40 @@ impl Decode {
     }
 }
 
+/// Byte ranges of the non-empty rows between newlines, in file order.
+///
+/// Same selection as `bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty())`,
+/// computed with memchr instead of a per-byte loop: `(start, end)` pairs into
+/// `bytes`. A trailing run without `\n` is returned as a row, exactly like split.
+fn row_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    for idx in memchr::memchr_iter(b'\n', bytes) {
+        if idx > start {
+            ranges.push((start, idx));
+        }
+        start = idx + 1;
+    }
+    if start < bytes.len() {
+        ranges.push((start, bytes.len()));
+    }
+    ranges
+}
+
 /// Split a window on `\n`, drop empty lines and decode each row.
 pub fn decode_rows(bytes: &[u8], mode: Decode) -> Result<Vec<String>, String> {
-    bytes
-        .split(|b| *b == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| decode_row(line, mode))
+    row_ranges(bytes)
+        .into_iter()
+        .map(|(start, end)| decode_row(&bytes[start..end], mode))
         .collect()
+}
+
+/// Split a window on `\n`, drop empty lines and return each row's raw bytes.
+///
+/// The bytes are exactly what the file holds between newlines: no UTF-8 decode,
+/// so invalid bytes pass through unchanged (the Python `raw=True` path).
+pub fn row_bytes(bytes: &[u8]) -> Vec<&[u8]> {
+    row_ranges(bytes).into_iter().map(|(start, end)| &bytes[start..end]).collect()
 }
 
 /// Decode one row. `Err` only in `Strict` mode, carrying the standard UTF-8 error text.
@@ -140,10 +167,12 @@ pub fn read_tail_bounded(
             starts_on_boundary = previous[0] == b'\n';
         }
         file.seek(SeekFrom::Start(start))?;
-        let mut data = Vec::new();
+        // One reservation so read_to_end issues a single large read instead of
+        // growing the buffer 32 KiB at a time.
+        let mut data = Vec::with_capacity(effective_bytes as usize);
         file.by_ref().take(effective_bytes).read_to_end(&mut data)?;
         let read_len = data.len() as u64;
-        let had_newline = data.iter().any(|b| *b == b'\n');
+        let had_newline = memchr::memchr(b'\n', &data).is_some();
 
         if !had_newline && start > 0 && bytes >= cap {
             return Ok(TailWindow {
@@ -156,23 +185,28 @@ pub fn read_tail_bounded(
             });
         }
 
+        // The returned rows live in data[front..front + complete]; slicing keeps
+        // the partial first row out without the drain memmove.
+        let mut front = 0usize;
         if start > 0 && !keep_partial_first && !starts_on_boundary {
-            if let Some(nl) = data.iter().position(|b| *b == b'\n') {
-                data.drain(..=nl);
-                start += (nl + 1) as u64;
-            } else {
-                start += data.len() as u64;
-                data.clear();
+            match memchr::memchr(b'\n', &data) {
+                Some(nl) => {
+                    front = nl + 1;
+                    start += (nl + 1) as u64;
+                }
+                None => {
+                    front = data.len();
+                    start += data.len() as u64;
+                }
             }
         }
-        let complete = data.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-        data.truncate(complete);
+        let complete = memchr::memrchr(b'\n', &data[front..]).map_or(0, |i| i + 1);
         let skipped_oversized = usize::from(
-            window_capped && had_newline && data.is_empty() && !keep_partial_first,
+            window_capped && had_newline && front >= data.len() && !keep_partial_first,
         );
         let end_offset = start + complete as u64;
         return Ok(TailWindow {
-            bytes: data,
+            bytes: data[front..front + complete].to_vec(),
             start_offset: if complete > 0 { start } else { end_offset },
             end_offset,
             skipped_oversized,
@@ -200,7 +234,7 @@ pub fn read_tail_bounded(
             scan -= amount as u64;
             file.seek(SeekFrom::Start(scan))?;
             file.read_exact(&mut block[..amount])?;
-            if let Some(i) = block[..amount].iter().rposition(|b| *b == b'\n') {
+            if let Some(i) = memchr::memrchr(b'\n', &block[..amount]) {
                 found = Some(scan + i as u64);
             }
         }
@@ -255,13 +289,12 @@ pub fn read_tail_bounded(
         pos -= amount as u64;
         file.seek(SeekFrom::Start(pos))?;
         file.read_exact(&mut block[..amount])?;
-        for i in (0..amount).rev() {
-            if block[i] == b'\n' {
-                count += 1;
-                if count == n {
-                    start = pos + i as u64 + 1;
-                    break;
-                }
+        let newlines: Vec<usize> = memchr::memchr_iter(b'\n', &block[..amount]).collect();
+        for &i in newlines.iter().rev() {
+            count += 1;
+            if count == n {
+                start = pos + i as u64 + 1;
+                break;
             }
         }
         if count == n {
@@ -281,35 +314,38 @@ pub fn read_tail_bounded(
 
     let read_len = complete_end - start;
     file.seek(SeekFrom::Start(start))?;
-    let mut data = Vec::new();
+    let mut data = Vec::with_capacity(read_len as usize);
     file.by_ref().take(read_len).read_to_end(&mut data)?;
 
     let mut ceiling_reached = false;
     let mut skipped_oversized = 0usize;
+    let mut front = 0usize;
     if count < n && min_start > 0 {
         if !(starts_on_boundary && count + 1 == n) {
             ceiling_reached = true;
         }
         if !starts_on_boundary {
-            if let Some(nl) = data.iter().position(|b| *b == b'\n') {
-                data.drain(..=nl);
-                start += (nl + 1) as u64;
-            } else {
-                start += data.len() as u64;
-                data.clear();
+            match memchr::memchr(b'\n', &data) {
+                Some(nl) => {
+                    front = nl + 1;
+                    start += (nl + 1) as u64;
+                }
+                None => {
+                    front = data.len();
+                    start += data.len() as u64;
+                }
             }
-            if data.is_empty() {
+            if front >= data.len() {
                 skipped_oversized = 1;
             }
         }
     }
 
-    let complete = data.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-    data.truncate(complete);
+    let complete = memchr::memrchr(b'\n', &data[front..]).map_or(0, |i| i + 1);
 
     let end_offset = trailing_start.max(start + complete as u64);
     Ok(TailWindow {
-        bytes: data,
+        bytes: data[front..front + complete].to_vec(),
         start_offset: if complete > 0 { start } else { end_offset },
         end_offset,
         skipped_oversized,
@@ -397,7 +433,7 @@ fn forward_read_result(
     let mut consumed = 0u64;
     let mut complete_rows: &[u8] = data;
     if !starts_on_boundary {
-        match data.iter().position(|b| *b == b'\n') {
+        match memchr::memchr(b'\n', data) {
             Some(nl) => {
                 consumed = nl as u64 + 1;
                 complete_rows = &data[consumed as usize..];
@@ -405,10 +441,7 @@ fn forward_read_result(
             None => complete_rows = &[],
         }
     }
-    let complete_len = complete_rows
-        .iter()
-        .rposition(|b| *b == b'\n')
-        .map_or(0, |i| i + 1);
+    let complete_len = memchr::memrchr(b'\n', complete_rows).map_or(0, |i| i + 1);
     let trailing = &complete_rows[complete_len..];
     consumed += complete_len as u64;
 
@@ -416,7 +449,7 @@ fn forward_read_result(
         (
             complete_rows[..complete_len].to_vec(),
             start + consumed,
-            usize::from(capped && !trailing.is_empty() && !trailing.contains(&b'\n')),
+            usize::from(capped && !trailing.is_empty() && memchr::memchr(b'\n', trailing).is_none()),
         )
     } else {
         (Vec::new(), start, 0)
@@ -482,7 +515,8 @@ pub fn read_forward(path: &Path, start: u64, max_bytes: usize) -> std::io::Resul
         previous[0] == b'\n'
     };
     file.seek(SeekFrom::Start(start))?;
-    let mut data = Vec::new();
+    let want = max_bytes.min((before.size - start) as usize);
+    let mut data = Vec::with_capacity(want);
     file.by_ref().take(max_bytes as u64).read_to_end(&mut data)?;
     let after = SnapshotIdentity::stat(path)?;
     Ok(forward_read_result(
@@ -881,8 +915,31 @@ fn parse_errors(errors: &str) -> PyResult<Decode> {
 }
 
 #[cfg(feature = "extension-module")]
-fn split_rows(bytes: &[u8], mode: Decode) -> PyResult<Vec<String>> {
-    decode_rows(bytes, mode).map_err(pyo3::exceptions::PyValueError::new_err)
+fn parse_errors_for(errors: &str, raw: bool) -> PyResult<Option<Decode>> {
+    if raw {
+        // raw=True hands undecoded bytes back; errors is ignored entirely.
+        return Ok(None);
+    }
+    parse_errors(errors).map(Some)
+}
+
+/// Build the Python rows list: `str` rows decoded with `mode`, or `bytes` rows
+/// exactly as stored when `raw` is set. `mode` is `None` on the raw path.
+#[cfg(feature = "extension-module")]
+fn rows_to_py(py: Python<'_>, bytes: &[u8], mode: Option<Decode>, raw: bool) -> PyResult<Py<PyAny>> {
+    use pyo3::types::{PyBytes, PyList, PyString};
+    let list = PyList::empty(py);
+    if raw {
+        for row in row_bytes(bytes) {
+            list.append(PyBytes::new(py, row))?;
+        }
+    } else {
+        let mode = mode.expect("non-raw row build requires a decode mode");
+        for row in decode_rows(bytes, mode).map_err(pyo3::exceptions::PyValueError::new_err)? {
+            list.append(PyString::new(py, &row))?;
+        }
+    }
+    Ok(list.into_any().unbind())
 }
 
 #[cfg(feature = "extension-module")]
@@ -896,8 +953,9 @@ fn map_tail_io_err(err: std::io::Error) -> PyErr {
 }
 
 #[cfg(feature = "extension-module")]
-#[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false, errors="strict", end=None))]
+#[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false, errors="strict", end=None, raw=false))]
 fn tail_raw(
+    py: Python<'_>,
     path: &str,
     lines: Option<usize>,
     byte_window: Option<u64>,
@@ -905,8 +963,9 @@ fn tail_raw(
     keep_partial_first: bool,
     errors: &str,
     end: Option<u64>,
-) -> PyResult<Vec<String>> {
-    let mode = parse_errors(errors)?;
+    raw: bool,
+) -> PyResult<Py<PyAny>> {
+    let mode = parse_errors_for(errors, raw)?;
     let limit = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     let window = read_tail_bounded(
         Path::new(path),
@@ -917,12 +976,13 @@ fn tail_raw(
         end,
     )
     .map_err(map_tail_io_err)?;
-    split_rows(&window.bytes, mode)
+    rows_to_py(py, &window.bytes, mode, raw)
 }
 
 #[cfg(feature = "extension-module")]
-#[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false, errors="strict", end=None))]
+#[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false, errors="strict", end=None, raw=false))]
 fn tail_window_raw(
+    py: Python<'_>,
     path: &str,
     lines: Option<usize>,
     byte_window: Option<u64>,
@@ -930,8 +990,9 @@ fn tail_window_raw(
     keep_partial_first: bool,
     errors: &str,
     end: Option<u64>,
-) -> PyResult<(String, Vec<String>)> {
-    let mode = parse_errors(errors)?;
+    raw: bool,
+) -> PyResult<(String, Py<PyAny>)> {
+    let mode = parse_errors_for(errors, raw)?;
     let limit = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     let window = read_tail_bounded(
         Path::new(path),
@@ -952,19 +1013,21 @@ fn tail_window_raw(
     });
     let meta_json = serde_json::to_string(&meta)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    let rows = split_rows(&window.bytes, mode)?;
+    let rows = rows_to_py(py, &window.bytes, mode, raw)?;
     Ok((meta_json, rows))
 }
 
 #[cfg(feature = "extension-module")]
-#[pyfunction(signature = (path, offset=0, max_bytes=None, errors="strict"))]
+#[pyfunction(signature = (path, offset=0, max_bytes=None, errors="strict", raw=false))]
 fn read_forward_raw(
+    py: Python<'_>,
     path: &str,
     offset: u64,
     max_bytes: Option<usize>,
     errors: &str,
-) -> PyResult<(String, Vec<String>)> {
-    let mode = parse_errors(errors)?;
+    raw: bool,
+) -> PyResult<(String, Py<PyAny>)> {
+    let mode = parse_errors_for(errors, raw)?;
     let limit = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     let result = read_forward(Path::new(path), offset, limit).map_err(map_tail_io_err)?;
     let meta = json!({
@@ -981,7 +1044,7 @@ fn read_forward_raw(
     });
     let meta_json = serde_json::to_string(&meta)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    let rows = split_rows(&result.bytes, mode)?;
+    let rows = rows_to_py(py, &result.bytes, mode, raw)?;
     Ok((meta_json, rows))
 }
 
@@ -1302,6 +1365,28 @@ mod tests {
         assert_eq!(decode_row(b"x\xea\xb0y", Decode::Replace).unwrap(), "x\u{fffd}y");
         assert_eq!(decode_row(b"x\xea\xb0y", Decode::Ignore).unwrap(), "xy");
         assert!(Decode::parse("bogus").is_none());
+    }
+
+    // raw=True rows are the exact file bytes: valid UTF-8 rows match the decoded
+    // text, invalid bytes survive untouched, empty lines are dropped.
+    #[test]
+    fn row_bytes_matches_decoding_and_preserves_invalid_utf8() {
+        let content = b"{\"id\":1}\n{\"id\":2,\"t\":\"m\xffid\"}\n{\"id\":3,\"t\":\"\xed\x95\x9c\xea\xb8\x80\"}\n\n";
+        let rows = row_bytes(content);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], b"{\"id\":1}");
+        assert_eq!(rows[1], b"{\"id\":2,\"t\":\"m\xffid\"}");
+        assert_eq!(rows[2], "{\"id\":3,\"t\":\"한글\"}".as_bytes());
+        // valid rows equal the strict decode, byte for byte
+        assert_eq!(rows[0], decode_row(rows[0], Decode::Strict).unwrap().as_bytes());
+        assert_eq!(rows[2], decode_row(rows[2], Decode::Strict).unwrap().as_bytes());
+        // the damaged row cannot decode strictly but its bytes pass through unchanged
+        assert!(decode_row(rows[1], Decode::Strict).is_err());
+        assert_eq!(
+            decode_row(rows[1], Decode::Replace).unwrap(),
+            "{\"id\":2,\"t\":\"m\u{fffd}id\"}"
+        );
+        assert_eq!(rows[1].to_vec(), b"{\"id\":2,\"t\":\"m\xffid\"}".to_vec());
     }
 
     fn identity_with(size: u64, mtime_ns: i64, inode: u64) -> SnapshotIdentity {
