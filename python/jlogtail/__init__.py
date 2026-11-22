@@ -17,13 +17,17 @@ def tail(
     max_bytes=DEFAULT_MAX_BYTES,
     keep_partial_first=False,
     errors="strict",
+    end=None,
 ):
     """Return raw, complete JSONL rows from the last line or byte window.
 
     ``errors`` is ``"strict"`` (default, invalid UTF-8 raises ValueError), ``"replace"`` or ``"ignore"``.
+    ``end`` treats the file as if it ended at that byte offset: the final row must end
+    with a newline at ``end - 1`` (otherwise it is dropped like a trailing partial row),
+    and ``end`` beyond the file size raises ``ValueError``.
     """
     meta_json, rows = _tail_window_raw(
-        os.fspath(path), lines, byte_window, max_bytes, keep_partial_first, errors
+        os.fspath(path), lines, byte_window, max_bytes, keep_partial_first, errors, end
     )
     meta = json.loads(meta_json)
     if meta["skipped_oversized"]:
@@ -49,10 +53,16 @@ def tail_window(
     max_bytes=DEFAULT_MAX_BYTES,
     keep_partial_first=False,
     errors="strict",
+    end=None,
 ):
-    """Return bounded tail metadata and raw, complete JSONL rows. ``errors`` as in ``tail``."""
+    """Return bounded tail metadata and raw, complete JSONL rows. ``errors`` as in ``tail``.
+
+    ``meta`` carries ``start_offset`` (the byte offset of the first returned row,
+    equal to ``end_offset`` when no rows) so a reverse scan can continue with
+    ``end=meta["start_offset"]``.
+    """
     meta_json, rows = _tail_window_raw(
-        os.fspath(path), lines, byte_window, max_bytes, keep_partial_first, errors
+        os.fspath(path), lines, byte_window, max_bytes, keep_partial_first, errors, end
     )
     return json.loads(meta_json), rows
 

@@ -82,6 +82,7 @@ On M5 Pro, macOS arm64, hyperfine ran 3 warmups and 10 measured runs per command
 | `--lines N`, `-n N` | Read the last N complete records; default 10 |
 | `--bytes N`, `-c N` | Read N trailing bytes and drop a partial first record unless the window starts at a line boundary |
 | `--from-offset N` | Read complete records forward from a saved byte offset; the next cursor and identity verdict are printed to stderr as `jlogtail: forward: {...}` |
+| `--end N` | Read as if the file ended at byte offset N; the final row must end with a newline at N-1 (otherwise it is dropped), and N beyond the file size exits 2 |
 | `--follow`, `-f` | Emit complete appended records; restart from byte 0 after replacement or truncation |
 | `--filter PATH=VALUE` | Keep rows whose dotted key path equals the JSON value |
 | `--fields PATH,...` | Emit only the selected dotted paths as a compact object |

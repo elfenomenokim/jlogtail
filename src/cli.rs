@@ -12,6 +12,7 @@ struct Options {
     lines: Option<usize>,
     bytes: Option<u64>,
     from_offset: Option<u64>,
+    end: Option<u64>,
     follow: bool,
     filter: Option<(String, Value)>,
     fields: Vec<String>,
@@ -21,7 +22,7 @@ struct Options {
 }
 
 fn usage() -> &'static str {
-    "Usage: jlogtail FILE [--lines N | --bytes N | --from-offset N] [--follow] [--filter PATH=VALUE] [--fields PATH,...] [--keep-partial-first] [--poll-ms N] [--max-bytes N]\n\nReads complete JSONL records from the end of a file, or forward from a saved byte offset with --from-offset. Values use JSON syntax when valid, otherwise strings."
+    "Usage: jlogtail FILE [--lines N | --bytes N | --from-offset N] [--end N] [--follow] [--filter PATH=VALUE] [--fields PATH,...] [--keep-partial-first] [--poll-ms N] [--max-bytes N]\n\nReads complete JSONL records from the end of a file, or forward from a saved byte offset with --from-offset. --end reads as if the file ended at a byte offset. Values use JSON syntax when valid, otherwise strings."
 }
 
 enum Parsed {
@@ -44,6 +45,7 @@ fn parse(args: Vec<String>) -> Result<Parsed, String> {
         lines: Some(10),
         bytes: None,
         from_offset: None,
+        end: None,
         follow: false,
         filter: None,
         fields: Vec::new(),
@@ -80,9 +82,23 @@ fn parse(args: Vec<String>) -> Result<Parsed, String> {
                     .ok_or("--from-offset requires a byte offset")?
                     .parse()
                     .map_err(|_| "invalid byte offset")?;
+                if o.end.is_some() {
+                    return Err("--from-offset cannot be combined with --end".to_string());
+                }
                 o.from_offset = Some(n);
                 o.lines = None;
                 o.bytes = None;
+            }
+            "--end" => {
+                let n = it
+                    .next()
+                    .ok_or("--end requires a byte offset")?
+                    .parse()
+                    .map_err(|_| "invalid byte offset")?;
+                if o.from_offset.is_some() {
+                    return Err("--end cannot be combined with --from-offset".to_string());
+                }
+                o.end = Some(n);
             }
             "--follow" | "-f" => o.follow = true,
             "--keep-partial-first" => o.keep_partial = true,
@@ -125,6 +141,9 @@ fn parse(args: Vec<String>) -> Result<Parsed, String> {
             }
             _ => return Err(format!("unknown argument: {arg}\n{}", usage())),
         }
+    }
+    if o.end.is_some() && o.follow {
+        return Err("--end cannot be combined with --follow".to_string());
     }
     Ok(Parsed::Run(o))
 }
@@ -315,7 +334,7 @@ fn execute(o: Options) -> Result<(), String> {
         // A failed identity starts over from byte 0, like a rotation reset.
         (result.new_offset, false)
     } else {
-        let window = read_tail_bounded(&o.path, o.lines, o.bytes, o.keep_partial, o.max_bytes)
+        let window = read_tail_bounded(&o.path, o.lines, o.bytes, o.keep_partial, o.max_bytes, o.end)
             .map_err(|e| format!("{}: {e}", o.path.display()))?;
         emit(&window.bytes, &o, &mut out).map_err(|e| e.to_string())?;
         if window.skipped_oversized > 0 {
@@ -431,6 +450,7 @@ mod tests {
             lines: Some(10),
             bytes: None,
             from_offset: None,
+            end: None,
             follow: true,
             filter: None,
             fields: Vec::new(),
@@ -472,6 +492,29 @@ mod tests {
     }
 
     #[test]
+    fn end_flag_parses_and_conflicts_with_forward_and_follow() {
+        let parsed = parse(vec!["t.jsonl".into(), "--end".into(), "12".into()]).unwrap();
+        let Parsed::Run(o) = parsed else { panic!("expected run") };
+        assert_eq!(o.end, Some(12));
+        assert_eq!(o.lines, Some(10));
+        assert!(parse(vec![
+            "t.jsonl".into(),
+            "--from-offset".into(),
+            "12".into(),
+            "--end".into(),
+            "3".into(),
+        ])
+        .is_err());
+        assert!(parse(vec![
+            "t.jsonl".into(),
+            "--end".into(),
+            "3".into(),
+            "--follow".into(),
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn follow_bounds_appended_reads_and_skips_oversized_pending_record() {
         let dir = std::env::temp_dir().join(format!("jlogtail-cli-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -480,7 +523,8 @@ mod tests {
         std::fs::write(&path, b"{\"n\":1}\n").unwrap();
 
         let o = test_options(path.clone(), 32);
-        let window = read_tail_bounded(&path, o.lines, o.bytes, o.keep_partial, o.max_bytes).unwrap();
+        let window =
+            read_tail_bounded(&path, o.lines, o.bytes, o.keep_partial, o.max_bytes, o.end).unwrap();
         assert_eq!(window.bytes, b"{\"n\":1}\n");
 
         let mut state = FollowState {
@@ -523,7 +567,8 @@ mod tests {
         std::fs::write(&path, format!("{{\"huge\":\"{}", "x".repeat(100))).unwrap();
 
         let o = test_options(path.clone(), 32);
-        let window = read_tail_bounded(&path, o.lines, o.bytes, o.keep_partial, o.max_bytes).unwrap();
+        let window =
+            read_tail_bounded(&path, o.lines, o.bytes, o.keep_partial, o.max_bytes, o.end).unwrap();
         assert!(window.trailing_oversized);
         assert_eq!(window.skipped_oversized, 1);
 

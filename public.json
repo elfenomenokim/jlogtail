@@ -24,6 +24,7 @@
     "pyproject.toml",
     "python/jlogtail/__init__.py",
     "python/jlogtail/cli.py",
+    "python/tests/test_end.py",
     "src/cli.rs",
     "src/lib.rs",
     "src/main.rs",

@@ -3,6 +3,19 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses `MAJOR.MINOR.PATCH`.
 
+## [0.3.0] - 2026-11-23
+
+### Added
+
+- `end=` snapshot bound on `jlogtail.tail(..., end=None)`, `jlogtail.tail_window(..., end=None)`
+  and `jlogtail FILE --end N`: the read treats the file as if it ended at that byte offset,
+  so a caller can page backwards row by row. The final row must end with `\n` at `end - 1`,
+  otherwise it is dropped exactly like today's trailing partial row; `end` beyond the file size
+  raises `ValueError` (Python) or exits 2 (CLI), and `end=0` returns no rows. `tail_window` meta
+  gains `start_offset`, the byte offset of the first returned row (equal to `end_offset` when no
+  rows), which lets a reverse scan continue with `end=meta["start_offset"]` and stop when the
+  cursor no longer moves. Defaults are unchanged: `end=None` keeps the 0.2.2 behavior.
+
 ## [0.2.2] - 2026-11-22
 
 ### Added

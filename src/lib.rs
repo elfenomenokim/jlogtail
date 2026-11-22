@@ -66,6 +66,8 @@ pub fn run_cli(args: Vec<String>) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TailWindow {
     pub bytes: Vec<u8>,
+    /// The byte offset of the first returned row; equal to `end_offset` when no rows.
+    pub start_offset: u64,
     pub end_offset: u64,
     pub skipped_oversized: usize,
     pub ceiling_reached: bool,
@@ -79,18 +81,22 @@ pub fn read_tail(
     byte_window: Option<u64>,
     keep_partial_first: bool,
 ) -> std::io::Result<TailWindow> {
-    read_tail_bounded(path, lines, byte_window, keep_partial_first, DEFAULT_MAX_BYTES)
+    read_tail_bounded(path, lines, byte_window, keep_partial_first, DEFAULT_MAX_BYTES, None)
 }
 
 /// Read a suffix bounded by `max_bytes`, dropping a partial first row and any incomplete final row.
 ///
 /// Records larger than `max_bytes` are skipped instead of growing an unbounded buffer.
+/// `end` treats the file as if it ended at that byte offset (a snapshot bound): the final row
+/// must end with `\n` at `end - 1`, otherwise it is dropped like today's trailing partial row.
+/// `end` beyond the file size is an `InvalidInput` error; `end = 0` reads no rows.
 pub fn read_tail_bounded(
     path: &Path,
     lines: Option<usize>,
     byte_window: Option<u64>,
     keep_partial_first: bool,
     max_bytes: usize,
+    end: Option<u64>,
 ) -> std::io::Result<TailWindow> {
     if max_bytes == 0 {
         return Err(std::io::Error::new(
@@ -100,10 +106,21 @@ pub fn read_tail_bounded(
     }
     let cap = max_bytes as u64;
     let mut file = File::open(path)?;
-    let size = file.metadata()?.len();
+    let file_size = file.metadata()?.len();
+    let size = match end {
+        Some(bound) if bound > file_size => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("end ({bound}) is beyond the file size ({file_size})"),
+            ));
+        }
+        Some(bound) => bound,
+        None => file_size,
+    };
     if size == 0 {
         return Ok(TailWindow {
             bytes: Vec::new(),
+            start_offset: 0,
             end_offset: 0,
             skipped_oversized: 0,
             ceiling_reached: false,
@@ -131,6 +148,7 @@ pub fn read_tail_bounded(
         if !had_newline && start > 0 && bytes >= cap {
             return Ok(TailWindow {
                 bytes: Vec::new(),
+                start_offset: start + read_len,
                 end_offset: start + read_len,
                 skipped_oversized: 1,
                 ceiling_reached: true,
@@ -152,9 +170,11 @@ pub fn read_tail_bounded(
         let skipped_oversized = usize::from(
             window_capped && had_newline && data.is_empty() && !keep_partial_first,
         );
+        let end_offset = start + complete as u64;
         return Ok(TailWindow {
             bytes: data,
-            end_offset: start + complete as u64,
+            start_offset: if complete > 0 { start } else { end_offset },
+            end_offset,
             skipped_oversized,
             ceiling_reached: window_capped,
             trailing_oversized: false,
@@ -193,6 +213,7 @@ pub fn read_tail_bounded(
                 if min_scan > 0 || size > cap {
                     return Ok(TailWindow {
                         bytes: Vec::new(),
+                        start_offset: size,
                         end_offset: size,
                         skipped_oversized: 1,
                         ceiling_reached: true,
@@ -208,6 +229,7 @@ pub fn read_tail_bounded(
     if n == 0 || logical_end == 0 {
         return Ok(TailWindow {
             bytes: Vec::new(),
+            start_offset: trailing_start,
             end_offset: trailing_start,
             skipped_oversized: 0,
             ceiling_reached: false,
@@ -285,9 +307,11 @@ pub fn read_tail_bounded(
     let complete = data.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
     data.truncate(complete);
 
+    let end_offset = trailing_start.max(start + complete as u64);
     Ok(TailWindow {
         bytes: data,
-        end_offset: trailing_start.max(start + complete as u64),
+        start_offset: if complete > 0 { start } else { end_offset },
+        end_offset,
         skipped_oversized,
         ceiling_reached,
         trailing_oversized: false,
@@ -872,7 +896,7 @@ fn map_tail_io_err(err: std::io::Error) -> PyErr {
 }
 
 #[cfg(feature = "extension-module")]
-#[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false, errors="strict"))]
+#[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false, errors="strict", end=None))]
 fn tail_raw(
     path: &str,
     lines: Option<usize>,
@@ -880,16 +904,24 @@ fn tail_raw(
     max_bytes: Option<usize>,
     keep_partial_first: bool,
     errors: &str,
+    end: Option<u64>,
 ) -> PyResult<Vec<String>> {
     let mode = parse_errors(errors)?;
     let limit = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
-    let window = read_tail_bounded(Path::new(path), lines, byte_window, keep_partial_first, limit)
-        .map_err(map_tail_io_err)?;
+    let window = read_tail_bounded(
+        Path::new(path),
+        lines,
+        byte_window,
+        keep_partial_first,
+        limit,
+        end,
+    )
+    .map_err(map_tail_io_err)?;
     split_rows(&window.bytes, mode)
 }
 
 #[cfg(feature = "extension-module")]
-#[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false, errors="strict"))]
+#[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false, errors="strict", end=None))]
 fn tail_window_raw(
     path: &str,
     lines: Option<usize>,
@@ -897,12 +929,21 @@ fn tail_window_raw(
     max_bytes: Option<usize>,
     keep_partial_first: bool,
     errors: &str,
+    end: Option<u64>,
 ) -> PyResult<(String, Vec<String>)> {
     let mode = parse_errors(errors)?;
     let limit = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
-    let window = read_tail_bounded(Path::new(path), lines, byte_window, keep_partial_first, limit)
-        .map_err(map_tail_io_err)?;
+    let window = read_tail_bounded(
+        Path::new(path),
+        lines,
+        byte_window,
+        keep_partial_first,
+        limit,
+        end,
+    )
+    .map_err(map_tail_io_err)?;
     let meta = json!({
+        "start_offset": window.start_offset,
         "end_offset": window.end_offset,
         "max_bytes": limit,
         "skipped_oversized": window.skipped_oversized,
@@ -1095,7 +1136,7 @@ mod tests {
     fn read_tail_bounded_rejects_zero_ceiling() {
         let path = scratch_file("zero-cap");
         std::fs::write(&path, b"{\"a\":1}\n").unwrap();
-        let err = read_tail_bounded(&path, Some(1), None, false, 0).unwrap_err();
+        let err = read_tail_bounded(&path, Some(1), None, false, 0, None).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
@@ -1105,7 +1146,7 @@ mod tests {
         let row = "{\"msg\":\"0123456789\"}\n";
         let content = row.repeat(20);
         std::fs::write(&path, content.as_bytes()).unwrap();
-        let window = read_tail_bounded(&path, Some(20), None, false, 50).unwrap();
+        let window = read_tail_bounded(&path, Some(20), None, false, 50, None).unwrap();
         assert!(window.ceiling_reached);
         assert_eq!(window.skipped_oversized, 0);
         assert!(!window.trailing_oversized);
@@ -1121,7 +1162,7 @@ mod tests {
         let mut content = small.to_vec();
         content.extend_from_slice(format!("{{\"big\":\"{}\"}}\n", "x".repeat(200)).as_bytes());
         std::fs::write(&path, &content).unwrap();
-        let window = read_tail_bounded(&path, Some(10), None, false, 64).unwrap();
+        let window = read_tail_bounded(&path, Some(10), None, false, 64, None).unwrap();
         assert!(window.bytes.is_empty());
         assert!(window.ceiling_reached);
         assert_eq!(window.skipped_oversized, 1);
@@ -1135,7 +1176,7 @@ mod tests {
         let mut content = b"{\"ok\":1}\n".to_vec();
         content.extend_from_slice(format!("{{\"big\":\"{}", "x".repeat(200)).as_bytes());
         std::fs::write(&path, &content).unwrap();
-        let window = read_tail_bounded(&path, Some(10), None, false, 64).unwrap();
+        let window = read_tail_bounded(&path, Some(10), None, false, 64, None).unwrap();
         assert!(window.bytes.is_empty());
         assert!(window.ceiling_reached);
         assert_eq!(window.skipped_oversized, 1);
@@ -1152,10 +1193,99 @@ mod tests {
         content.extend_from_slice(r1);
         content.extend_from_slice(r2);
         std::fs::write(&path, &content).unwrap();
-        let window = read_tail_bounded(&path, None, Some(1000), false, 20).unwrap();
+        let window = read_tail_bounded(&path, None, Some(1000), false, 20, None).unwrap();
         assert!(window.ceiling_reached);
         assert_eq!(window.bytes, r2);
         assert_eq!(window.end_offset, content.len() as u64);
+    }
+
+    #[test]
+    fn end_mid_row_drops_that_row_and_reports_offsets() {
+        let path = scratch_file("end-mid-row");
+        let content = b"{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n";
+        std::fs::write(&path, content).unwrap();
+        let size = content.len() as u64;
+        // One byte before the file end still lands inside the third row.
+        let window = read_tail_bounded(&path, Some(10), None, false, DEFAULT_MAX_BYTES, Some(size - 1)).unwrap();
+        assert_eq!(window.bytes, b"{\"n\":1}\n{\"n\":2}\n");
+        assert_eq!(window.end_offset, size - 8);
+        assert_eq!(window.start_offset, 0);
+    }
+
+    #[test]
+    fn end_after_a_newline_includes_the_row_ending_there() {
+        let path = scratch_file("end-boundary");
+        let content = b"{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n";
+        std::fs::write(&path, content).unwrap();
+        let size = content.len() as u64;
+        let r1_end = 8;
+        let window = read_tail_bounded(&path, Some(10), None, false, DEFAULT_MAX_BYTES, Some(r1_end)).unwrap();
+        assert_eq!(window.bytes, b"{\"n\":1}\n");
+        assert_eq!(window.start_offset, 0);
+        assert_eq!(window.end_offset, r1_end);
+        let window = read_tail_bounded(&path, Some(10), None, false, DEFAULT_MAX_BYTES, Some(size)).unwrap();
+        assert_eq!(window.bytes, content);
+        assert_eq!(window.start_offset, 0);
+        assert_eq!(window.end_offset, size);
+    }
+
+    // `start_offset` lets a caller page backwards: cursor = size, then
+    // cursor = start_offset until it stops moving or reaches 0.
+    #[test]
+    fn start_offset_supports_a_reverse_scan() {
+        let path = scratch_file("end-reverse");
+        let content = b"{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n";
+        std::fs::write(&path, content).unwrap();
+        let size = content.len() as u64;
+        // lines mode
+        let window = read_tail_bounded(&path, Some(2), None, false, DEFAULT_MAX_BYTES, Some(size)).unwrap();
+        assert_eq!(window.bytes, b"{\"n\":2}\n{\"n\":3}\n");
+        assert_eq!(window.start_offset, 8);
+        assert_eq!(window.end_offset, size);
+        // byte_window mode
+        let window = read_tail_bounded(&path, None, Some(16), false, DEFAULT_MAX_BYTES, Some(size)).unwrap();
+        assert_eq!(window.bytes, b"{\"n\":2}\n{\"n\":3}\n");
+        assert_eq!(window.start_offset, 8);
+        assert_eq!(window.end_offset, size);
+        // one row per window visits every row, newest first, and stops at 0
+        let mut cursor = size;
+        let mut newest_first: Vec<String> = Vec::new();
+        while cursor > 0 {
+            let window = read_tail_bounded(&path, Some(1), None, false, DEFAULT_MAX_BYTES, Some(cursor)).unwrap();
+            newest_first.extend(decode_rows(&window.bytes, Decode::Strict).unwrap());
+            let next = window.start_offset;
+            assert!(next < cursor, "cursor must move: {cursor} -> {next}");
+            cursor = next;
+        }
+        newest_first.reverse();
+        assert_eq!(newest_first, vec!["{\"n\":1}", "{\"n\":2}", "{\"n\":3}"]);
+    }
+
+    // A single record that can never fit the ceiling parks the cursor at the
+    // end, so a reverse scan observes start_offset == end_offset and stops.
+    #[test]
+    fn reverse_scan_terminates_when_the_single_row_exceeds_max_bytes() {
+        let path = scratch_file("end-oversized");
+        let row = format!("{{\"big\":\"{}\"}}\n", "x".repeat(200));
+        std::fs::write(&path, row.as_bytes()).unwrap();
+        let size = row.len() as u64;
+        let window = read_tail_bounded(&path, Some(10), None, false, 64, Some(size)).unwrap();
+        assert!(window.bytes.is_empty());
+        assert_eq!(window.skipped_oversized, 1);
+        assert!(window.ceiling_reached);
+        assert_eq!(window.start_offset, window.end_offset);
+    }
+
+    #[test]
+    fn end_beyond_size_is_rejected_and_end_zero_is_empty() {
+        let path = scratch_file("end-bounds");
+        std::fs::write(&path, b"{\"n\":1}\n").unwrap();
+        let err = read_tail_bounded(&path, Some(1), None, false, DEFAULT_MAX_BYTES, Some(9)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let window = read_tail_bounded(&path, Some(1), None, false, DEFAULT_MAX_BYTES, Some(0)).unwrap();
+        assert!(window.bytes.is_empty());
+        assert_eq!(window.start_offset, 0);
+        assert_eq!(window.end_offset, 0);
     }
 
     #[test]
@@ -1361,7 +1491,7 @@ mod tests {
         let mut content = Vec::new();
         content.extend_from_slice(b"{\"id\":1}\n{\"id\":2,\"t\":\"m\xffid\"}\n{\"id\":3,\"t\":\"la\xc3st\"}\n");
         std::fs::write(&path, &content).unwrap();
-        let window = read_tail_bounded(&path, Some(10), None, false, DEFAULT_MAX_BYTES).unwrap();
+        let window = read_tail_bounded(&path, Some(10), None, false, DEFAULT_MAX_BYTES, None).unwrap();
         assert!(decode_rows(&window.bytes, Decode::Strict).is_err());
         let replaced = decode_rows(&window.bytes, Decode::Replace).unwrap();
         assert_eq!(replaced.len(), 3);
