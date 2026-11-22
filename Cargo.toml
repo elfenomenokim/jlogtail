@@ -1,6 +1,6 @@
 [package]
 name = "jlogtail"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Tail large JSON Lines transcripts by record or byte window"
 license = "MIT"

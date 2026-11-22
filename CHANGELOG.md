@@ -3,6 +3,16 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses `MAJOR.MINOR.PATCH`.
 
+## [0.2.1] - 2026-11-22
+
+### Added
+
+- `errors` option (`"strict"` default, `"replace"`, `"ignore"`) on `jlogtail.tail(...)` and
+  `jlogtail.tail_window(...)`. `"strict"` keeps the old behavior (`ValueError` on invalid UTF-8);
+  `"replace"` substitutes U+FFFD for each invalid sequence and `"ignore"` drops invalid bytes, so one
+  damaged byte no longer fails the whole window. Rows are split on `\n` before decoding, so damage in
+  one row never touches its neighbors. An unknown value raises `ValueError`.
+
 ## [0.2.0] - 2026-11-19
 
 ### Added

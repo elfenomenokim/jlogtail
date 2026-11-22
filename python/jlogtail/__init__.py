@@ -15,10 +15,14 @@ def tail(
     byte_window=None,
     max_bytes=DEFAULT_MAX_BYTES,
     keep_partial_first=False,
+    errors="strict",
 ):
-    """Return raw, complete JSONL rows from the last line or byte window."""
+    """Return raw, complete JSONL rows from the last line or byte window.
+
+    ``errors`` is ``"strict"`` (default, invalid UTF-8 raises ValueError), ``"replace"`` or ``"ignore"``.
+    """
     meta_json, rows = _tail_window_raw(
-        os.fspath(path), lines, byte_window, max_bytes, keep_partial_first
+        os.fspath(path), lines, byte_window, max_bytes, keep_partial_first, errors
     )
     meta = json.loads(meta_json)
     if meta["skipped_oversized"]:
@@ -43,10 +47,11 @@ def tail_window(
     byte_window=None,
     max_bytes=DEFAULT_MAX_BYTES,
     keep_partial_first=False,
+    errors="strict",
 ):
-    """Return bounded tail metadata and raw, complete JSONL rows."""
+    """Return bounded tail metadata and raw, complete JSONL rows. ``errors`` as in ``tail``."""
     meta_json, rows = _tail_window_raw(
-        os.fspath(path), lines, byte_window, max_bytes, keep_partial_first
+        os.fspath(path), lines, byte_window, max_bytes, keep_partial_first, errors
     )
     return json.loads(meta_json), rows
 

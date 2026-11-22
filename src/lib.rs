@@ -11,6 +11,54 @@ pub const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const RECORD_CAP: usize = 256 * 1024;
 pub(crate) const CHUNK: usize = 64 * 1024;
 
+/// How Python-facing row decoding treats invalid UTF-8 (`errors=` in the Python API).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decode {
+    /// Fail the whole read (default, Python `errors="strict"`).
+    Strict,
+    /// Replace each maximal invalid subpart with U+FFFD (Python `errors="replace"`).
+    Replace,
+    /// Drop invalid bytes (Python `errors="ignore"`).
+    Ignore,
+}
+
+impl Decode {
+    pub fn parse(name: &str) -> Option<Decode> {
+        match name {
+            "strict" => Some(Decode::Strict),
+            "replace" => Some(Decode::Replace),
+            "ignore" => Some(Decode::Ignore),
+            _ => None,
+        }
+    }
+}
+
+/// Split a window on `\n`, drop empty lines and decode each row.
+pub fn decode_rows(bytes: &[u8], mode: Decode) -> Result<Vec<String>, String> {
+    bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| decode_row(line, mode))
+        .collect()
+}
+
+/// Decode one row. `Err` only in `Strict` mode, carrying the standard UTF-8 error text.
+pub fn decode_row(line: &[u8], mode: Decode) -> Result<String, String> {
+    match mode {
+        Decode::Strict => std::str::from_utf8(line)
+            .map(str::to_owned)
+            .map_err(|e| e.to_string()),
+        Decode::Replace => Ok(String::from_utf8_lossy(line).into_owned()),
+        Decode::Ignore => {
+            let mut out = String::with_capacity(line.len());
+            for chunk in line.utf8_chunks() {
+                out.push_str(chunk.valid());
+            }
+            Ok(out)
+        }
+    }
+}
+
 pub fn run_cli(args: Vec<String>) -> Result<(), String> {
     cli::run(args)
 }
@@ -622,15 +670,17 @@ fn select_native_py(path: &str) -> PyResult<(String, Vec<String>)> {
 }
 
 #[cfg(feature = "extension-module")]
-fn split_rows(bytes: &[u8]) -> PyResult<Vec<String>> {
-    bytes
-        .split(|b| *b == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            String::from_utf8(line.to_vec())
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-        })
-        .collect()
+fn parse_errors(errors: &str) -> PyResult<Decode> {
+    Decode::parse(errors).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "errors must be 'strict', 'replace' or 'ignore', got {errors:?}"
+        ))
+    })
+}
+
+#[cfg(feature = "extension-module")]
+fn split_rows(bytes: &[u8], mode: Decode) -> PyResult<Vec<String>> {
+    decode_rows(bytes, mode).map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 #[cfg(feature = "extension-module")]
@@ -644,29 +694,33 @@ fn map_tail_io_err(err: std::io::Error) -> PyErr {
 }
 
 #[cfg(feature = "extension-module")]
-#[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false))]
+#[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false, errors="strict"))]
 fn tail_raw(
     path: &str,
     lines: Option<usize>,
     byte_window: Option<u64>,
     max_bytes: Option<usize>,
     keep_partial_first: bool,
+    errors: &str,
 ) -> PyResult<Vec<String>> {
+    let mode = parse_errors(errors)?;
     let limit = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     let window = read_tail_bounded(Path::new(path), lines, byte_window, keep_partial_first, limit)
         .map_err(map_tail_io_err)?;
-    split_rows(&window.bytes)
+    split_rows(&window.bytes, mode)
 }
 
 #[cfg(feature = "extension-module")]
-#[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false))]
+#[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false, errors="strict"))]
 fn tail_window_raw(
     path: &str,
     lines: Option<usize>,
     byte_window: Option<u64>,
     max_bytes: Option<usize>,
     keep_partial_first: bool,
+    errors: &str,
 ) -> PyResult<(String, Vec<String>)> {
+    let mode = parse_errors(errors)?;
     let limit = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     let window = read_tail_bounded(Path::new(path), lines, byte_window, keep_partial_first, limit)
         .map_err(map_tail_io_err)?;
@@ -679,7 +733,7 @@ fn tail_window_raw(
     });
     let meta_json = serde_json::to_string(&meta)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    let rows = split_rows(&window.bytes)?;
+    let rows = split_rows(&window.bytes, mode)?;
     Ok((meta_json, rows))
 }
 
@@ -894,5 +948,43 @@ mod tests {
         assert!(window.ceiling_reached);
         assert_eq!(window.bytes, r2);
         assert_eq!(window.end_offset, content.len() as u64);
+    }
+
+    #[test]
+    fn decode_row_modes_handle_invalid_utf8() {
+        let bad = b"{\"a\":\"b\xff\xfead\"}";
+        assert!(decode_row(bad, Decode::Strict).is_err());
+        assert_eq!(decode_row(bad, Decode::Replace).unwrap(), "{\"a\":\"b\u{fffd}\u{fffd}ad\"}");
+        assert_eq!(decode_row(bad, Decode::Ignore).unwrap(), "{\"a\":\"bad\"}");
+        let good = "{\"a\":\"한글\"}".as_bytes();
+        for mode in [Decode::Strict, Decode::Replace, Decode::Ignore] {
+            assert_eq!(decode_row(good, mode).unwrap(), "{\"a\":\"한글\"}");
+        }
+        // a multibyte character cut in half is one invalid subpart, as in Python
+        assert_eq!(decode_row(b"x\xea\xb0y", Decode::Replace).unwrap(), "x\u{fffd}y");
+        assert_eq!(decode_row(b"x\xea\xb0y", Decode::Ignore).unwrap(), "xy");
+        assert!(Decode::parse("bogus").is_none());
+    }
+
+    #[test]
+    fn invalid_utf8_in_middle_and_last_row_follows_the_mode() {
+        let path = scratch_file("invalid-utf8");
+        let mut content = Vec::new();
+        content.extend_from_slice(b"{\"id\":1}\n{\"id\":2,\"t\":\"m\xffid\"}\n{\"id\":3,\"t\":\"la\xc3st\"}\n");
+        std::fs::write(&path, &content).unwrap();
+        let window = read_tail_bounded(&path, Some(10), None, false, DEFAULT_MAX_BYTES).unwrap();
+        assert!(decode_rows(&window.bytes, Decode::Strict).is_err());
+        let replaced = decode_rows(&window.bytes, Decode::Replace).unwrap();
+        assert_eq!(replaced.len(), 3);
+        assert_eq!(replaced[0], "{\"id\":1}");
+        assert_eq!(replaced[1], "{\"id\":2,\"t\":\"m\u{fffd}id\"}");
+        assert_eq!(replaced[2], "{\"id\":3,\"t\":\"la\u{fffd}st\"}");
+        let ignored = decode_rows(&window.bytes, Decode::Ignore).unwrap();
+        assert_eq!(ignored[1], "{\"id\":2,\"t\":\"mid\"}");
+        assert_eq!(ignored[2], "{\"id\":3,\"t\":\"last\"}");
+        // damage only in the last row still fails strict and survives replace
+        let last_only = b"{\"id\":1}\n{\"id\":2,\"t\":\"x\xff\"}\n";
+        assert!(decode_rows(last_only, Decode::Strict).is_err());
+        assert_eq!(decode_rows(last_only, Decode::Replace).unwrap().len(), 2);
     }
 }

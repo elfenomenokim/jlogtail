@@ -89,7 +89,7 @@ M5 Pro macOS arm64에서 hyperfine으로 명령마다 예열 3회와 측정 10�
 | `--keep-partial-first` | 바이트 창에서 첫 행의 일부도 유지합니다. |
 | `--version`, `-V` | `jlogtail` 버전을 출력하고 종료합니다. |
 
-Python 모듈의 `jlogtail.tail(path, lines=10, byte_window=None, max_bytes=jlogtail.DEFAULT_MAX_BYTES, keep_partial_first=False)`는 완성된 원본 행을 반환하며, 상한 초과로 행을 건너뛰거나 창이 잘리면 `RuntimeWarning`을 발생시킵니다. `jlogtail.tail_window(...)`는 `end_offset`, `max_bytes`, `skipped_oversized`, `ceiling_reached`, `trailing_oversized`가 담긴 메타데이터 사전과 행 목록을 함께 반환합니다. `jlogtail.select_native(path)`는 메타데이터 사전과 오래된 순서의 최근 Codex 메시지 객체를 반환합니다. `lib/native-history-tail.py`는 기존 feno-handoff의 단일 경로 인자와 메타데이터 출력을 유지합니다.
+Python 모듈의 `jlogtail.tail(path, lines=10, byte_window=None, max_bytes=jlogtail.DEFAULT_MAX_BYTES, keep_partial_first=False, errors="strict")`는 완성된 원본 행을 반환하며, 상한 초과로 행을 건너뛰거나 창이 잘리면 `RuntimeWarning`을 발생시킵니다. `errors`는 `"strict"`(기본, 잘못된 UTF-8이면 `ValueError`), `"replace"`(잘못된 시퀀스마다 U+FFFD) 또는 `"ignore"`(잘못된 바이트 제거)이며, 행을 먼저 나눈 뒤 디코드하므로 손상된 행이 이웃 행에 영향을 주지 않습니다. `jlogtail.tail_window(...)`는 `end_offset`, `max_bytes`, `skipped_oversized`, `ceiling_reached`, `trailing_oversized`가 담긴 메타데이터 사전과 행 목록을 함께 반환합니다. `jlogtail.select_native(path)`는 메타데이터 사전과 오래된 순서의 최근 Codex 메시지 객체를 반환합니다. `lib/native-history-tail.py`는 기존 feno-handoff의 단일 경로 인자와 메타데이터 출력을 유지합니다.
 
 ## 제한
 
