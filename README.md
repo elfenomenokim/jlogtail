@@ -32,12 +32,11 @@ The demo uses synthetic transcript rows. It shows field selection and filtering,
 ## Install
 
 ```sh
-cargo install --path .
-pipx install jlogtail
-# or: uv tool install jlogtail
+uv tool install jlogtail
+# or: pipx install jlogtail
 ```
 
-The wheel installs the `jlogtail` command and the importable `jlogtail` PyO3 module. Use Cargo to install the standalone Rust CLI from this directory. Python 3.9+ is required; source builds also require Rust.
+The wheel installs the `jlogtail` command and the importable `jlogtail` PyO3 module; it needs no Rust. To build the standalone Rust CLI instead, run `cargo install --path .` in a checkout of this repository (it is not on crates.io). Python 3.9+ is required; source builds also require Rust.
 
 ## Quick start
 

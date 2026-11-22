@@ -2,6 +2,27 @@
 
 This folder contains the Rust CLI and PyO3 extension for reading JSON Lines tails.
 
+## Set up for a user
+
+Goal: `jlogtail` prints the last records of a large JSON Lines file (agent transcripts) without reading the whole file. Nothing here needs the person except which file.
+
+1. Check what is present.
+   - `uv --version` prints a version. If not: `curl -LsSf https://astral.sh/uv/install.sh | sh`, then `export PATH="$HOME/.local/bin:$PATH"` (or open a new shell).
+   - No Rust or compiler is needed for this route.
+2. Install: `uv tool install jlogtail`. It ends with `Installed 1 executable: jlogtail`. `uv tool update-shell` puts `~/.local/bin` on PATH for later shells. (Rust CLI from source instead: clone the repository and run `cargo install --path .` there; there is no crates.io package.)
+3. Prove it on a synthetic file:
+   ```sh
+   d=$(mktemp -d); printf '{"role":"user","text":"hi"}\n{"role":"assistant","text":"one"}\n{"role":"assistant","text":"two"}\n' > $d/t.jsonl
+   jlogtail $d/t.jsonl --lines 2 --fields role,text; rm -rf $d
+   ```
+   It prints `{"role":"assistant","text":"one"}` and `{"role":"assistant","text":"two"}` and exits 0.
+4. Real use: ask "어느 로그나 대화 기록(.jsonl) 파일을 볼까요?", then `jlogtail FILE --lines 20`. Claude Code transcripts live under `~/.claude/projects/`, Codex under `~/.codex/sessions/`; read them only for the user's request, and never paste their contents into a public place.
+5. If it fails, in this order:
+   - `jlogtail: command not found`: `~/.local/bin` is not on PATH (step 2).
+   - `FILE: No such file or directory (os error 2)`, exit 2: the path is wrong.
+   - Empty output: the file has no complete record in that window (the last line may still be unfinished); raise `--lines` or `--bytes`.
+   - `skipped oversized record` on stderr: a record is bigger than `--max-bytes` (default 64 MiB); raise it only if the user needs that record.
+
 ## Layout
 
 - `src/lib.rs`: shared bounded suffix reader, Codex history selector, and PyO3 module.
@@ -12,7 +33,7 @@ This folder contains the Rust CLI and PyO3 extension for reading JSON Lines tail
 
 ## Build
 
-Run `cargo build --release` in this directory. Install the Rust command with `cargo install --path .`, or install the Python wheel and command with `pipx install jlogtail` / `uv tool install jlogtail`.
+Run `cargo build --release` in this directory. Install the Rust command with `cargo install --path .`, or install the Python wheel and command with `uv tool install jlogtail` / `pipx install jlogtail`.
 
 ## Style and behavior
 

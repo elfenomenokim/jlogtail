@@ -32,12 +32,11 @@ Rust · Python 3.9+
 ## 설치
 
 ```sh
-cargo install --path .
-pipx install jlogtail
-# 또는: uv tool install jlogtail
+uv tool install jlogtail
+# 또는: pipx install jlogtail
 ```
 
-wheel을 설치하면 `jlogtail` 명령과 가져올 수 있는 PyO3 `jlogtail` 모듈을 함께 사용할 수 있습니다. Cargo 명령은 이 디렉터리의 독립 Rust CLI를 설치합니다. Python 3.9 이상이 필요하고, 소스 빌드에는 Rust 도구 모음도 필요합니다.
+wheel을 설치하면 `jlogtail` 명령과 가져올 수 있는 PyO3 `jlogtail` 모듈을 함께 사용할 수 있고, Rust는 필요 없습니다. 독립 Rust CLI를 직접 빌드하려면 이 저장소를 받아 그 디렉터리에서 `cargo install --path .`을 실행하세요(crates.io에는 올라가 있지 않습니다). Python 3.9 이상이 필요하고, 소스 빌드에는 Rust 도구 모음도 필요합니다.
 
 ## 시작하기
 
