@@ -294,6 +294,184 @@ pub fn read_tail_bounded(
     })
 }
 
+/// Snapshot identity of a log file: the platform file ID (dev/ino, or its
+/// Windows equivalent) plus size and mtime in nanoseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotIdentity {
+    pub file_id: file_id::FileId,
+    pub size: u64,
+    pub mtime_ns: i64,
+}
+
+impl SnapshotIdentity {
+    pub fn stat(path: &Path) -> std::io::Result<SnapshotIdentity> {
+        let metadata = std::fs::metadata(path)?;
+        Ok(SnapshotIdentity {
+            file_id: file_id::get_file_id(path)?,
+            size: metadata.len(),
+            mtime_ns: system_time_ns(metadata.modified()?),
+        })
+    }
+}
+
+fn system_time_ns(time: std::time::SystemTime) -> i64 {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_nanos().min(i64::MAX as u128) as i64,
+        Err(e) => -(e.duration().as_nanos().min(i64::MAX as u128) as i64),
+    }
+}
+
+/// Result of one bounded forward read from a saved byte offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardRead {
+    /// Complete rows read forward from the offset, oldest first; empty when
+    /// `identity_ok` is false.
+    pub bytes: Vec<u8>,
+    /// Cursor to save for the next call: the byte after the last complete row.
+    pub new_offset: u64,
+    /// False when the file was replaced, shrank below the offset, or changed
+    /// during the read; `bytes` is then empty and `new_offset` is the unchanged
+    /// start offset (0 when the file no longer reaches the saved offset).
+    pub identity_ok: bool,
+    /// The platform file ID differed around the read (replacement or rotation).
+    pub rotated: bool,
+    /// The file shrank below the saved offset or while it was being read.
+    pub truncated: bool,
+    /// Size or mtime differed between the snapshots taken around the read.
+    pub changed: bool,
+    /// File size observed after the read.
+    pub size: u64,
+    /// File mtime in nanoseconds observed after the read.
+    pub mtime_ns: i64,
+    /// `max_bytes` cut the read before the end of the file.
+    pub ceiling_reached: bool,
+    /// A record that cannot complete inside the window was skipped; the cursor
+    /// stays before it.
+    pub skipped_oversized: usize,
+}
+
+/// Combine the snapshots taken around a read with the bytes read into a
+/// [`ForwardRead`]. Pure so rotation and truncation answers are testable.
+fn forward_read_result(
+    before: &SnapshotIdentity,
+    opened: &SnapshotIdentity,
+    after: &SnapshotIdentity,
+    start: u64,
+    data: &[u8],
+    starts_on_boundary: bool,
+    max_bytes: usize,
+) -> ForwardRead {
+    let rotated = before.file_id != opened.file_id || opened.file_id != after.file_id;
+    let truncated = after.size < start || after.size < before.size;
+    let changed = before.size != after.size
+        || before.mtime_ns != after.mtime_ns
+        || opened.size != before.size
+        || opened.mtime_ns != before.mtime_ns;
+    let identity_ok = !rotated && !truncated && !changed;
+
+    let capped = data.len() == max_bytes && start + (data.len() as u64) < before.size;
+    let mut consumed = 0u64;
+    let mut complete_rows: &[u8] = data;
+    if !starts_on_boundary {
+        match data.iter().position(|b| *b == b'\n') {
+            Some(nl) => {
+                consumed = nl as u64 + 1;
+                complete_rows = &data[consumed as usize..];
+            }
+            None => complete_rows = &[],
+        }
+    }
+    let complete_len = complete_rows
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |i| i + 1);
+    let trailing = &complete_rows[complete_len..];
+    consumed += complete_len as u64;
+
+    let (bytes, new_offset, skipped_oversized) = if identity_ok {
+        (
+            complete_rows[..complete_len].to_vec(),
+            start + consumed,
+            usize::from(capped && !trailing.is_empty() && !trailing.contains(&b'\n')),
+        )
+    } else {
+        (Vec::new(), start, 0)
+    };
+    ForwardRead {
+        bytes,
+        new_offset,
+        identity_ok,
+        rotated,
+        truncated,
+        changed,
+        size: after.size,
+        mtime_ns: after.mtime_ns,
+        ceiling_reached: capped,
+        skipped_oversized,
+    }
+}
+
+/// Read complete rows forward from a saved byte offset, verifying that the file
+/// did not rotate, shrink, or change while it was read.
+///
+/// `start` is a cursor from a previous call's [`ForwardRead::new_offset`] (0
+/// reads from the beginning). At most `max_bytes` are read. A partial first row
+/// is dropped when `start` is not at a line boundary, and an unterminated
+/// trailing row is held: `new_offset` stops before it and a later call returns
+/// it once the writer finishes it. When the dev/ino/size/mtime snapshot taken
+/// before and after the read disagrees, or the file shrank below `start`, the
+/// answer reports `identity_ok = false` with no rows instead of guessing, and
+/// the caller decides whether to rescan from 0. A record that can never
+/// complete inside `max_bytes` parks the cursor with `skipped_oversized = 1`;
+/// it is reported, never partially returned.
+pub fn read_forward(path: &Path, start: u64, max_bytes: usize) -> std::io::Result<ForwardRead> {
+    if max_bytes == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "max_bytes must be greater than 0",
+        ));
+    }
+    let before = SnapshotIdentity::stat(path)?;
+    if start > before.size {
+        // The saved offset no longer exists: only a fresh scan from 0 is safe.
+        return Ok(ForwardRead {
+            bytes: Vec::new(),
+            new_offset: 0,
+            identity_ok: false,
+            rotated: false,
+            truncated: true,
+            changed: false,
+            size: before.size,
+            mtime_ns: before.mtime_ns,
+            ceiling_reached: false,
+            skipped_oversized: 0,
+        });
+    }
+    let mut file = File::open(path)?;
+    let opened = SnapshotIdentity::stat(path)?;
+    let starts_on_boundary = if start == 0 {
+        true
+    } else {
+        file.seek(SeekFrom::Start(start - 1))?;
+        let mut previous = [0u8; 1];
+        file.read_exact(&mut previous)?;
+        previous[0] == b'\n'
+    };
+    file.seek(SeekFrom::Start(start))?;
+    let mut data = Vec::new();
+    file.by_ref().take(max_bytes as u64).read_to_end(&mut data)?;
+    let after = SnapshotIdentity::stat(path)?;
+    Ok(forward_read_result(
+        &before,
+        &opened,
+        &after,
+        start,
+        &data,
+        starts_on_boundary,
+        max_bytes,
+    ))
+}
+
 fn text_field<'a>(row: &'a Value, key: &str) -> Option<&'a str> {
     row.get(key).and_then(Value::as_str)
 }
@@ -738,6 +916,35 @@ fn tail_window_raw(
 }
 
 #[cfg(feature = "extension-module")]
+#[pyfunction(signature = (path, offset=0, max_bytes=None, errors="strict"))]
+fn read_forward_raw(
+    path: &str,
+    offset: u64,
+    max_bytes: Option<usize>,
+    errors: &str,
+) -> PyResult<(String, Vec<String>)> {
+    let mode = parse_errors(errors)?;
+    let limit = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+    let result = read_forward(Path::new(path), offset, limit).map_err(map_tail_io_err)?;
+    let meta = json!({
+        "new_offset": result.new_offset,
+        "identity_ok": result.identity_ok,
+        "rotated": result.rotated,
+        "truncated": result.truncated,
+        "changed": result.changed,
+        "size": result.size,
+        "mtime_ns": result.mtime_ns,
+        "max_bytes": limit,
+        "ceiling_reached": result.ceiling_reached,
+        "skipped_oversized": result.skipped_oversized,
+    });
+    let meta_json = serde_json::to_string(&meta)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let rows = split_rows(&result.bytes, mode)?;
+    Ok((meta_json, rows))
+}
+
+#[cfg(feature = "extension-module")]
 #[pyfunction]
 fn cli_entry(py: Python<'_>) -> PyResult<()> {
     let args = py
@@ -757,6 +964,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(select_native_py, m)?)?;
     m.add_function(wrap_pyfunction!(tail_raw, m)?)?;
     m.add_function(wrap_pyfunction!(tail_window_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(read_forward_raw, m)?)?;
     m.add_function(wrap_pyfunction!(cli_entry, m)?)?;
     Ok(())
 }
@@ -964,6 +1172,187 @@ mod tests {
         assert_eq!(decode_row(b"x\xea\xb0y", Decode::Replace).unwrap(), "x\u{fffd}y");
         assert_eq!(decode_row(b"x\xea\xb0y", Decode::Ignore).unwrap(), "xy");
         assert!(Decode::parse("bogus").is_none());
+    }
+
+    fn identity_with(size: u64, mtime_ns: i64, inode: u64) -> SnapshotIdentity {
+        SnapshotIdentity {
+            file_id: file_id::FileId::new_inode(1, inode),
+            size,
+            mtime_ns,
+        }
+    }
+
+    // Append: a cursor read returns only the new rows and advances to EOF.
+    #[test]
+    fn read_forward_reads_appends_and_advances_the_cursor() {
+        let path = scratch_file("forward-append");
+        std::fs::write(&path, b"{\"a\":1}\n{\"b\":2}\n").unwrap();
+        let first = read_forward(&path, 0, DEFAULT_MAX_BYTES).unwrap();
+        assert!(first.identity_ok, "{first:?}");
+        assert_eq!(first.bytes, b"{\"a\":1}\n{\"b\":2}\n");
+        assert_eq!(first.new_offset, 16);
+        assert!(!first.ceiling_reached);
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"c\":3}\n").unwrap();
+        drop(file);
+        let second = read_forward(&path, first.new_offset, DEFAULT_MAX_BYTES).unwrap();
+        assert!(second.identity_ok, "{second:?}");
+        assert_eq!(second.bytes, b"{\"c\":3}\n");
+        assert_eq!(second.new_offset, 24);
+        // A cursor at EOF is a cheap no-op poll.
+        let idle = read_forward(&path, second.new_offset, DEFAULT_MAX_BYTES).unwrap();
+        assert!(idle.identity_ok);
+        assert!(idle.bytes.is_empty());
+        assert_eq!(idle.new_offset, second.new_offset);
+    }
+
+    // Partial final row: the cursor holds before it, and the completed row
+    // arrives on the next read from the same cursor.
+    #[test]
+    fn read_forward_holds_an_unterminated_trailing_row() {
+        let path = scratch_file("forward-partial");
+        std::fs::write(&path, b"{\"a\":1}\n{\"b\":").unwrap();
+        let first = read_forward(&path, 0, DEFAULT_MAX_BYTES).unwrap();
+        assert!(first.identity_ok, "{first:?}");
+        assert_eq!(first.bytes, b"{\"a\":1}\n");
+        assert_eq!(first.new_offset, 8);
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"2}\n").unwrap();
+        drop(file);
+        let second = read_forward(&path, first.new_offset, DEFAULT_MAX_BYTES).unwrap();
+        assert!(second.identity_ok, "{second:?}");
+        assert_eq!(second.bytes, b"{\"b\":2}\n");
+        assert_eq!(second.new_offset, 16);
+    }
+
+    // A cursor that lands inside a record behaves like a byte window: the
+    // partial first row is dropped and the cursor advances past its newline.
+    #[test]
+    fn read_forward_drops_a_partial_first_row_off_boundary() {
+        let path = scratch_file("forward-boundary");
+        std::fs::write(&path, b"{\"long\":1}\n{\"b\":2}\n").unwrap();
+        let result = read_forward(&path, 5, DEFAULT_MAX_BYTES).unwrap();
+        assert!(result.identity_ok, "{result:?}");
+        assert_eq!(result.bytes, b"{\"b\":2}\n");
+        assert_eq!(result.new_offset, result.size);
+    }
+
+    // A record that cannot complete inside the window parks the cursor and is
+    // reported instead of being returned in pieces.
+    #[test]
+    fn read_forward_flags_a_record_spanning_the_window() {
+        let path = scratch_file("forward-span");
+        let row = format!("{{\"big\":\"{}\"}}\n", "x".repeat(200));
+        std::fs::write(&path, row.as_bytes()).unwrap();
+        let result = read_forward(&path, 0, 64).unwrap();
+        assert!(result.identity_ok, "{result:?}");
+        assert!(result.bytes.is_empty());
+        assert!(result.ceiling_reached);
+        assert_eq!(result.skipped_oversized, 1);
+        assert_eq!(result.new_offset, 0);
+    }
+
+    // Truncation: a rotated file that is smaller than the saved offset gets a
+    // truncation answer with a 0 cursor, never rows guessed from a new file.
+    #[test]
+    fn read_forward_answers_truncation_when_the_file_shrinks_below_the_cursor() {
+        let path = scratch_file("forward-truncate");
+        std::fs::write(&path, b"{\"a\":1}\n{\"b\":2}\n").unwrap();
+        let first = read_forward(&path, 0, DEFAULT_MAX_BYTES).unwrap();
+        assert!(first.identity_ok);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"{\"x\":9}\n").unwrap();
+        let second = read_forward(&path, first.new_offset, DEFAULT_MAX_BYTES).unwrap();
+        assert!(!second.identity_ok, "{second:?}");
+        assert!(second.truncated);
+        assert!(!second.rotated);
+        assert!(second.bytes.is_empty());
+        assert_eq!(second.new_offset, 0);
+    }
+
+    // Rotation with a new inode: no rows, the cursor stays put for the caller
+    // to rescan, and the answer names rotation.
+    #[test]
+    fn read_forward_rotation_new_inode_reports_no_rows() {
+        let before = identity_with(100, 1000, 7);
+        let opened = before;
+        let mut after = before;
+        after.file_id = file_id::FileId::new_inode(1, 8);
+        let result = forward_read_result(&before, &opened, &after, 10, b"{\"a\":1}\n", true, DEFAULT_MAX_BYTES);
+        assert!(!result.identity_ok, "{result:?}");
+        assert!(result.rotated);
+        assert!(!result.truncated);
+        assert!(!result.changed);
+        assert!(result.bytes.is_empty());
+        assert_eq!(result.new_offset, 10);
+    }
+
+    // An mtime move without a file-ID change is a change, not a rotation.
+    #[test]
+    fn read_forward_moved_mtime_is_a_change_not_a_rotation() {
+        let before = identity_with(100, 1000, 7);
+        let opened = before;
+        let after = identity_with(100, 2000, 7);
+        let result = forward_read_result(&before, &opened, &after, 10, b"{\"a\":1}\n", true, DEFAULT_MAX_BYTES);
+        assert!(!result.identity_ok, "{result:?}");
+        assert!(!result.rotated);
+        assert!(!result.truncated);
+        assert!(result.changed);
+        assert!(result.bytes.is_empty());
+        assert_eq!(result.new_offset, 10);
+    }
+
+    // Growth between the before snapshot and the read is reported as a change.
+    #[test]
+    fn read_forward_growth_between_snapshots_is_a_change() {
+        let before = identity_with(100, 1000, 7);
+        let opened = before;
+        let after = identity_with(120, 1000, 7);
+        let result = forward_read_result(&before, &opened, &after, 10, b"{\"a\":1}\n", true, DEFAULT_MAX_BYTES);
+        assert!(!result.identity_ok, "{result:?}");
+        assert!(result.changed);
+        assert!(!result.truncated);
+    }
+
+    // A shrink during the read is a truncation answer, not guessed rows.
+    #[test]
+    fn read_forward_shrink_during_read_is_truncation() {
+        let before = identity_with(100, 1000, 7);
+        let opened = before;
+        let after = identity_with(40, 1000, 7);
+        let result = forward_read_result(&before, &opened, &after, 10, b"{\"a\":1}\n", true, DEFAULT_MAX_BYTES);
+        assert!(!result.identity_ok, "{result:?}");
+        assert!(result.truncated);
+        assert_eq!(result.new_offset, 10);
+    }
+
+    // Invalid UTF-8 follows the decode mode exactly like the tail reader.
+    #[test]
+    fn read_forward_decodes_with_the_errors_mode() {
+        let path = scratch_file("forward-decode");
+        std::fs::write(&path, b"{\"a\":\"x\xff\"}\n").unwrap();
+        let result = read_forward(&path, 0, DEFAULT_MAX_BYTES).unwrap();
+        assert!(result.identity_ok);
+        assert!(decode_rows(&result.bytes, Decode::Strict).is_err());
+        assert_eq!(
+            decode_rows(&result.bytes, Decode::Replace).unwrap(),
+            vec!["{\"a\":\"x\u{fffd}\"}".to_string()]
+        );
+        assert_eq!(
+            decode_rows(&result.bytes, Decode::Ignore).unwrap(),
+            vec!["{\"a\":\"x\"}".to_string()]
+        );
+    }
+
+    // Zero ceiling is rejected like the tail reader.
+    #[test]
+    fn read_forward_rejects_zero_ceiling() {
+        let path = scratch_file("forward-zero-cap");
+        std::fs::write(&path, b"{\"a\":1}\n").unwrap();
+        let err = read_forward(&path, 0, 0).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

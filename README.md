@@ -81,6 +81,7 @@ On M5 Pro, macOS arm64, hyperfine ran 3 warmups and 10 measured runs per command
 |---|---|
 | `--lines N`, `-n N` | Read the last N complete records; default 10 |
 | `--bytes N`, `-c N` | Read N trailing bytes and drop a partial first record unless the window starts at a line boundary |
+| `--from-offset N` | Read complete records forward from a saved byte offset; the next cursor and identity verdict are printed to stderr as `jlogtail: forward: {...}` |
 | `--follow`, `-f` | Emit complete appended records; restart from byte 0 after replacement or truncation |
 | `--filter PATH=VALUE` | Keep rows whose dotted key path equals the JSON value |
 | `--fields PATH,...` | Emit only the selected dotted paths as a compact object |
@@ -89,7 +90,7 @@ On M5 Pro, macOS arm64, hyperfine ran 3 warmups and 10 measured runs per command
 | `--keep-partial-first` | Keep the first partial row in a byte window |
 | `--version`, `-V` | Print the `jlogtail` version and exit |
 
-The Python module provides `jlogtail.tail(path, lines=10, byte_window=None, max_bytes=jlogtail.DEFAULT_MAX_BYTES, keep_partial_first=False, errors="strict")` for raw complete rows (emitting a `RuntimeWarning` if a record is skipped or the window hits `max_bytes`). `errors` is `"strict"` (default: invalid UTF-8 raises `ValueError`), `"replace"` (U+FFFD per invalid sequence) or `"ignore"` (drop invalid bytes); rows are split before decoding, so one damaged row never affects its neighbors. `jlogtail.tail_window(...)` returns `(meta, rows)` with `end_offset`, `max_bytes`, `skipped_oversized`, `ceiling_reached`, and `trailing_oversized`. `jlogtail.select_native(path)` returns a metadata dictionary and oldest-to-newest Codex message objects. `lib/native-history-tail.py` preserves feno-handoff's existing one-path command and metadata output.
+The Python module provides `jlogtail.tail(path, lines=10, byte_window=None, max_bytes=jlogtail.DEFAULT_MAX_BYTES, keep_partial_first=False, errors="strict")` for raw complete rows (emitting a `RuntimeWarning` if a record is skipped or the window hits `max_bytes`). `errors` is `"strict"` (default: invalid UTF-8 raises `ValueError`), `"replace"` (U+FFFD per invalid sequence) or `"ignore"` (drop invalid bytes); rows are split before decoding, so one damaged row never affects its neighbors. `jlogtail.tail_window(...)` returns `(meta, rows)` with `end_offset`, `max_bytes`, `skipped_oversized`, `ceiling_reached`, and `trailing_oversized`. `jlogtail.read_forward(path, offset=0, max_bytes=jlogtail.DEFAULT_MAX_BYTES, errors="strict")` reads forward from a saved byte offset and returns `(meta, rows)`: `meta["new_offset"]` is the cursor to save, and `meta["identity_ok"]` is false — with `rows` empty — when the file was replaced, shrank below the offset, or changed during the read, so callers rescan instead of guessing. An unterminated trailing row is held until it completes. `jlogtail.select_native(path)` returns a metadata dictionary and oldest-to-newest Codex message objects. `lib/native-history-tail.py` preserves feno-handoff's existing one-path command and metadata output.
 
 ## Limits
 

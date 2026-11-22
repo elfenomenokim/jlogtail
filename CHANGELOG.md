@@ -3,6 +3,22 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses `MAJOR.MINOR.PATCH`.
 
+## [0.2.2] - 2026-11-22
+
+### Added
+
+- Forward read from a saved byte offset: `read_forward(path, start, max_bytes)` in Rust,
+  `jlogtail.read_forward(path, offset=..., max_bytes=..., errors=...)` in Python, and
+  `jlogtail FILE --from-offset N` in the CLI. One call reads at most `max_bytes` forward from
+  the cursor and answers `(rows, new_offset, identity_ok)`: `new_offset` is the cursor to save
+  (it stops before an unterminated trailing row, which a later call returns once complete), and
+  `identity_ok` is false — with no rows, never guessed rows — when the dev/ino/size/mtime snapshot
+  taken before and after the read disagrees or the file shrank below the offset. A partial first
+  row is dropped when the offset is not at a line boundary, and a record that can never complete
+  inside the window parks the cursor with `skipped_oversized = 1`. The Python call accepts the
+  same `errors` option as `tail`; the CLI prints rows on stdout and the forward metadata JSON on
+  stderr (`jlogtail: forward: {...}`), and `--from-offset` composes with `--follow`.
+
 ## [0.2.1] - 2026-11-22
 
 ### Added

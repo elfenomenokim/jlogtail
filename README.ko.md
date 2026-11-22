@@ -81,6 +81,7 @@ M5 Pro macOS arm64에서 hyperfine으로 명령마다 예열 3회와 측정 10�
 |---|---|
 | `--lines N`, `-n N` | 마지막 N개의 완전한 행을 읽습니다. 기본값은 10입니다. |
 | `--bytes N`, `-c N` | 마지막 N바이트를 읽고, 첫 행이 잘렸을 때만 해당 부분을 버립니다. |
+| `--from-offset N` | 저장한 바이트 오프셋부터 앞으로 완전한 행을 읽고, 다음 커서와 신원 판정을 `jlogtail: forward: {...}` 형태로 stderr에 출력합니다. |
 | `--follow`, `-f` | 완성된 추가 행을 출력하고, 파일 교체나 잘림 뒤 처음부터 읽습니다. |
 | `--filter PATH=VALUE` | 점으로 구분한 경로의 값이 일치하는 행만 남깁니다. |
 | `--fields PATH,...` | 선택한 경로만 간결한 객체로 출력합니다. |
@@ -89,7 +90,7 @@ M5 Pro macOS arm64에서 hyperfine으로 명령마다 예열 3회와 측정 10�
 | `--keep-partial-first` | 바이트 창에서 첫 행의 일부도 유지합니다. |
 | `--version`, `-V` | `jlogtail` 버전을 출력하고 종료합니다. |
 
-Python 모듈의 `jlogtail.tail(path, lines=10, byte_window=None, max_bytes=jlogtail.DEFAULT_MAX_BYTES, keep_partial_first=False, errors="strict")`는 완성된 원본 행을 반환하며, 상한 초과로 행을 건너뛰거나 창이 잘리면 `RuntimeWarning`을 발생시킵니다. `errors`는 `"strict"`(기본, 잘못된 UTF-8이면 `ValueError`), `"replace"`(잘못된 시퀀스마다 U+FFFD) 또는 `"ignore"`(잘못된 바이트 제거)이며, 행을 먼저 나눈 뒤 디코드하므로 손상된 행이 이웃 행에 영향을 주지 않습니다. `jlogtail.tail_window(...)`는 `end_offset`, `max_bytes`, `skipped_oversized`, `ceiling_reached`, `trailing_oversized`가 담긴 메타데이터 사전과 행 목록을 함께 반환합니다. `jlogtail.select_native(path)`는 메타데이터 사전과 오래된 순서의 최근 Codex 메시지 객체를 반환합니다. `lib/native-history-tail.py`는 기존 feno-handoff의 단일 경로 인자와 메타데이터 출력을 유지합니다.
+Python 모듈의 `jlogtail.tail(path, lines=10, byte_window=None, max_bytes=jlogtail.DEFAULT_MAX_BYTES, keep_partial_first=False, errors="strict")`는 완성된 원본 행을 반환하며, 상한 초과로 행을 건너뛰거나 창이 잘리면 `RuntimeWarning`을 발생시킵니다. `errors`는 `"strict"`(기본, 잘못된 UTF-8이면 `ValueError`), `"replace"`(잘못된 시퀀스마다 U+FFFD) 또는 `"ignore"`(잘못된 바이트 제거)이며, 행을 먼저 나눈 뒤 디코드하므로 손상된 행이 이웃 행에 영향을 주지 않습니다. `jlogtail.tail_window(...)`는 `end_offset`, `max_bytes`, `skipped_oversized`, `ceiling_reached`, `trailing_oversized`가 담긴 메타데이터 사전과 행 목록을 함께 반환합니다. `jlogtail.read_forward(path, offset=0, max_bytes=jlogtail.DEFAULT_MAX_BYTES, errors="strict")`는 저장한 바이트 오프셋부터 앞으로 읽어 `(메타데이터, 행)`을 반환합니다. `meta["new_offset"]`는 저장할 커서이며, 파일이 교체되었거나 오프셋 아래로 줄었거나 읽는 동안 바뀌면 `meta["identity_ok"]`가 거짓이 되고 `rows`는 비어 있어, 호출자가 추측하지 않고 처음부터 다시 읽습니다. 줄바꿈으로 끝나지 않은 마지막 행은 완성될 때까지 보류합니다. `jlogtail.select_native(path)`는 메타데이터 사전과 오래된 순서의 최근 Codex 메시지 객체를 반환합니다. `lib/native-history-tail.py`는 기존 feno-handoff의 단일 경로 인자와 메타데이터 출력을 유지합니다.
 
 ## 제한
 

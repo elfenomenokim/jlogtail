@@ -11,6 +11,7 @@ struct Options {
     path: PathBuf,
     lines: Option<usize>,
     bytes: Option<u64>,
+    from_offset: Option<u64>,
     follow: bool,
     filter: Option<(String, Value)>,
     fields: Vec<String>,
@@ -20,7 +21,7 @@ struct Options {
 }
 
 fn usage() -> &'static str {
-    "Usage: jlogtail FILE [--lines N | --bytes N] [--follow] [--filter PATH=VALUE] [--fields PATH,...] [--keep-partial-first] [--poll-ms N] [--max-bytes N]\n\nReads complete JSONL records from the end of a file. Values use JSON syntax when valid, otherwise strings."
+    "Usage: jlogtail FILE [--lines N | --bytes N | --from-offset N] [--follow] [--filter PATH=VALUE] [--fields PATH,...] [--keep-partial-first] [--poll-ms N] [--max-bytes N]\n\nReads complete JSONL records from the end of a file, or forward from a saved byte offset with --from-offset. Values use JSON syntax when valid, otherwise strings."
 }
 
 enum Parsed {
@@ -42,6 +43,7 @@ fn parse(args: Vec<String>) -> Result<Parsed, String> {
         path: PathBuf::from(first),
         lines: Some(10),
         bytes: None,
+        from_offset: None,
         follow: false,
         filter: None,
         fields: Vec::new(),
@@ -60,6 +62,7 @@ fn parse(args: Vec<String>) -> Result<Parsed, String> {
                     .map_err(|_| "invalid line count")?;
                 o.lines = Some(n);
                 o.bytes = None;
+                o.from_offset = None;
             }
             "--bytes" | "-c" => {
                 let n = it
@@ -69,6 +72,17 @@ fn parse(args: Vec<String>) -> Result<Parsed, String> {
                     .map_err(|_| "invalid byte count")?;
                 o.bytes = Some(n);
                 o.lines = None;
+                o.from_offset = None;
+            }
+            "--from-offset" => {
+                let n = it
+                    .next()
+                    .ok_or("--from-offset requires a byte offset")?
+                    .parse()
+                    .map_err(|_| "invalid byte offset")?;
+                o.from_offset = Some(n);
+                o.lines = None;
+                o.bytes = None;
             }
             "--follow" | "-f" => o.follow = true,
             "--keep-partial-first" => o.keep_partial = true,
@@ -257,36 +271,80 @@ fn read_follow_appended(
 }
 
 fn execute(o: Options) -> Result<(), String> {
-    let window = read_tail_bounded(&o.path, o.lines, o.bytes, o.keep_partial, o.max_bytes)
-        .map_err(|e| format!("{}: {e}", o.path.display()))?;
     let mut out = io::stdout().lock();
     let mut err = io::stderr().lock();
-    emit(&window.bytes, &o, &mut out).map_err(|e| e.to_string())?;
-    if window.skipped_oversized > 0 {
-        writeln!(
-            err,
-            "jlogtail: skipped {} oversized record(s) exceeding max-bytes ({})",
-            window.skipped_oversized, o.max_bytes
-        )
-        .map_err(|e| e.to_string())?;
+    let (follow_offset, follow_skip_oversized) = if let Some(start) = o.from_offset {
+        let result = crate::read_forward(&o.path, start, o.max_bytes)
+            .map_err(|e| format!("{}: {e}", o.path.display()))?;
+        if result.identity_ok {
+            emit(&result.bytes, &o, &mut out).map_err(|e| e.to_string())?;
+        }
+        if result.skipped_oversized > 0 {
+            writeln!(
+                err,
+                "jlogtail: skipped {} oversized record(s) exceeding max-bytes ({})",
+                result.skipped_oversized, o.max_bytes
+            )
+            .map_err(|e| e.to_string())?;
+        } else if result.ceiling_reached {
+            writeln!(
+                err,
+                "jlogtail: forward window capped at max-bytes ({})",
+                o.max_bytes
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let meta = serde_json::json!({
+            "offset": start,
+            "new_offset": result.new_offset,
+            "identity_ok": result.identity_ok,
+            "rotated": result.rotated,
+            "truncated": result.truncated,
+            "changed": result.changed,
+            "size": result.size,
+            "mtime_ns": result.mtime_ns,
+            "max_bytes": o.max_bytes,
+            "ceiling_reached": result.ceiling_reached,
+            "skipped_oversized": result.skipped_oversized,
+        });
+        writeln!(err, "jlogtail: forward: {meta}").map_err(|e| e.to_string())?;
         err.flush().map_err(|e| e.to_string())?;
-    } else if window.ceiling_reached {
-        writeln!(
-            err,
-            "jlogtail: tail window capped at max-bytes ({})",
-            o.max_bytes
-        )
-        .map_err(|e| e.to_string())?;
-        err.flush().map_err(|e| e.to_string())?;
-    }
-    if !o.follow {
-        return Ok(());
-    }
+        if !o.follow {
+            return Ok(());
+        }
+        // A failed identity starts over from byte 0, like a rotation reset.
+        (result.new_offset, false)
+    } else {
+        let window = read_tail_bounded(&o.path, o.lines, o.bytes, o.keep_partial, o.max_bytes)
+            .map_err(|e| format!("{}: {e}", o.path.display()))?;
+        emit(&window.bytes, &o, &mut out).map_err(|e| e.to_string())?;
+        if window.skipped_oversized > 0 {
+            writeln!(
+                err,
+                "jlogtail: skipped {} oversized record(s) exceeding max-bytes ({})",
+                window.skipped_oversized, o.max_bytes
+            )
+            .map_err(|e| e.to_string())?;
+            err.flush().map_err(|e| e.to_string())?;
+        } else if window.ceiling_reached {
+            writeln!(
+                err,
+                "jlogtail: tail window capped at max-bytes ({})",
+                o.max_bytes
+            )
+            .map_err(|e| e.to_string())?;
+            err.flush().map_err(|e| e.to_string())?;
+        }
+        if !o.follow {
+            return Ok(());
+        }
+        (window.end_offset, window.trailing_oversized)
+    };
     let mut current_id = identity(&o.path).map_err(|e| e.to_string())?;
     let mut state = FollowState {
-        offset: window.end_offset,
+        offset: follow_offset,
         pending: Vec::new(),
-        skip_oversized: window.trailing_oversized,
+        skip_oversized: follow_skip_oversized,
     };
     let mut buf = vec![0u8; o.max_bytes.min(CHUNK).max(1)];
     loop {
@@ -372,6 +430,7 @@ mod tests {
             path,
             lines: Some(10),
             bytes: None,
+            from_offset: None,
             follow: true,
             filter: None,
             fields: Vec::new(),
@@ -379,6 +438,37 @@ mod tests {
             keep_partial: false,
             max_bytes,
         }
+    }
+
+    #[test]
+    fn from_offset_mode_is_exclusive_with_lines_and_bytes() {
+        let parsed = parse(vec!["t.jsonl".into(), "--from-offset".into(), "12".into()]).unwrap();
+        let Parsed::Run(o) = parsed else { panic!("expected run") };
+        assert_eq!(o.from_offset, Some(12));
+        assert_eq!(o.lines, None);
+        assert_eq!(o.bytes, None);
+        let parsed = parse(vec![
+            "t.jsonl".into(),
+            "--from-offset".into(),
+            "12".into(),
+            "--lines".into(),
+            "3".into(),
+        ])
+        .unwrap();
+        let Parsed::Run(o) = parsed else { panic!("expected run") };
+        assert_eq!(o.lines, Some(3));
+        assert_eq!(o.from_offset, None);
+        let parsed = parse(vec![
+            "t.jsonl".into(),
+            "--from-offset".into(),
+            "12".into(),
+            "--bytes".into(),
+            "3".into(),
+        ])
+        .unwrap();
+        let Parsed::Run(o) = parsed else { panic!("expected run") };
+        assert_eq!(o.bytes, Some(3));
+        assert_eq!(o.from_offset, None);
     }
 
     #[test]
