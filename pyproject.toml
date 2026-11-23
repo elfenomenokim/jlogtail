@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "jlogtail"
-version = "0.3.1"
+version = "0.3.2"
 description = "Tail large JSON Lines transcripts by record or byte window."
 readme = "README.md"
 requires-python = ">=3.9"

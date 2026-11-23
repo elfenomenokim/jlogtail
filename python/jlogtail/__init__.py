@@ -59,20 +59,26 @@ def tail_window(
     errors="strict",
     end=None,
     raw=False,
+    blob=False,
 ):
     """Return bounded tail metadata and raw, complete JSONL rows. ``errors`` as in ``tail``.
 
     ``meta`` carries ``start_offset`` (the byte offset of the first returned row,
     equal to ``end_offset`` when no rows) so a reverse scan can continue with
     ``end=meta["start_offset"]``. ``raw=True`` returns ``bytes`` rows as in ``tail``.
+    ``blob=True`` returns ``(meta, data)`` where ``data`` is ONE ``bytes`` object
+    holding exactly the selected complete rows, each with its trailing ``\n`` —
+    ``b"".join(row + b"\n" for row in raw_rows)`` — built without per-row
+    objects; nothing is decoded, so ``errors`` and ``raw`` are ignored on the
+    blob path.
     """
-    meta_json, rows = _tail_window_raw(
-        os.fspath(path), lines, byte_window, max_bytes, keep_partial_first, errors, end, raw
+    meta_json, payload = _tail_window_raw(
+        os.fspath(path), lines, byte_window, max_bytes, keep_partial_first, errors, end, raw, blob
     )
-    return json.loads(meta_json), rows
+    return json.loads(meta_json), payload
 
 
-def read_forward(path, *, offset=0, max_bytes=DEFAULT_MAX_BYTES, errors="strict", raw=False):
+def read_forward(path, *, offset=0, max_bytes=DEFAULT_MAX_BYTES, errors="strict", raw=False, blob=False):
     """Read complete rows forward from a saved byte offset under snapshot identity.
 
     ``offset`` is a cursor from a previous call's ``meta["new_offset"]``; 0 reads
@@ -83,10 +89,13 @@ def read_forward(path, *, offset=0, max_bytes=DEFAULT_MAX_BYTES, errors="strict"
     reaches the saved offset), so the caller rescans instead of guessing. An
     unterminated trailing row is held: the cursor stops before it, and a later
     call returns it once the writer finishes it. ``errors`` is as in ``tail`` and
-    is ignored with ``raw=True``.
+    is ignored with ``raw=True``. ``blob=True`` returns ``(meta, data)`` where
+    ``data`` is ONE ``bytes`` object holding exactly the selected complete rows,
+    each with its trailing ``\n``; nothing is decoded, so ``errors`` and ``raw``
+    are ignored on the blob path.
     """
-    meta_json, rows = _read_forward_raw(os.fspath(path), offset, max_bytes, errors, raw)
-    return json.loads(meta_json), rows
+    meta_json, payload = _read_forward_raw(os.fspath(path), offset, max_bytes, errors, raw, blob)
+    return json.loads(meta_json), payload
 
 
 def select_native(path):

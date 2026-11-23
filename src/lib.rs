@@ -111,6 +111,97 @@ pub fn read_tail(
     read_tail_bounded(path, lines, byte_window, keep_partial_first, DEFAULT_MAX_BYTES, None)
 }
 
+/// Plan the single positioned read that fetches a byte window (plus, when
+/// needed, the one boundary probe byte before it).
+#[derive(Debug, Clone, Copy)]
+struct ByteWindowPlan {
+    /// Requested window start (before any partial-first-row trim).
+    start: u64,
+    /// 1 when the read includes the byte before `start` for the boundary check.
+    probe: u64,
+    read_offset: u64,
+    read_len: u64,
+    window_capped: bool,
+    bytes: u64,
+    cap: u64,
+}
+
+fn plan_byte_window(size: u64, bytes: u64, cap: u64, keep_partial_first: bool) -> ByteWindowPlan {
+    let effective_bytes = bytes.min(cap);
+    let window_capped = bytes > cap && size > cap;
+    let start = size.saturating_sub(effective_bytes);
+    // The boundary probe is pointless when the partial first row is kept.
+    let probe = u64::from(start > 0 && !keep_partial_first);
+    let read_offset = start - probe;
+    let read_len = (effective_bytes + probe).min(size - read_offset);
+    ByteWindowPlan {
+        start,
+        probe,
+        read_offset,
+        read_len,
+        window_capped,
+        bytes,
+        cap,
+    }
+}
+
+/// Where the complete rows live inside a byte-window read whose first byte is
+/// the plan's probe (when present).
+enum ByteWindowRows {
+    /// One record larger than the cap spans the window; the cursor resumes at
+    /// the end of the window bytes actually read.
+    Oversized { resume: u64 },
+    Rows {
+        front: usize,
+        complete: usize,
+        start: u64,
+        skipped_oversized: usize,
+    },
+}
+
+fn byte_window_rows(
+    data: &[u8],
+    plan: &ByteWindowPlan,
+    keep_partial_first: bool,
+) -> ByteWindowRows {
+    let front0 = (plan.probe as usize).min(data.len());
+    let window_read = data.len() as u64 - front0 as u64;
+    let had_newline = memchr::memchr(b'\n', &data[front0..]).is_some();
+    let starts_on_boundary = plan.start == 0 || data.first() == Some(&b'\n');
+    let mut start = plan.start;
+    if !had_newline && start > 0 && plan.bytes >= plan.cap {
+        return ByteWindowRows::Oversized {
+            resume: start + window_read,
+        };
+    }
+    let mut front = front0;
+    if start > 0 && !keep_partial_first && !starts_on_boundary {
+        match memchr::memchr(b'\n', &data[front..]) {
+            Some(nl) => {
+                front += nl + 1;
+                start += (nl + 1) as u64;
+            }
+            None => {
+                start += window_read;
+                front = data.len();
+            }
+        }
+    }
+    let complete = memchr::memrchr(b'\n', &data[front..]).map_or(0, |i| i + 1);
+    // This flag survives only in the defensive case where the trim above ran
+    // and yet reported a newline: kept so the answer stays decision-for-decision
+    // identical to a raw read.
+    let skipped_oversized = usize::from(
+        plan.window_capped && had_newline && front >= data.len() && !keep_partial_first,
+    );
+    ByteWindowRows::Rows {
+        front,
+        complete,
+        start,
+        skipped_oversized,
+    }
+}
+
 /// Read a suffix bounded by `max_bytes`, dropping a partial first row and any incomplete final row.
 ///
 /// Records larger than `max_bytes` are skipped instead of growing an unbounded buffer.
@@ -156,62 +247,43 @@ pub fn read_tail_bounded(
     }
 
     if let Some(bytes) = byte_window {
-        let effective_bytes = bytes.min(cap);
-        let window_capped = bytes > cap && size > cap;
-        let mut start = size.saturating_sub(effective_bytes);
-        let mut starts_on_boundary = start == 0;
-        if start > 0 && !keep_partial_first {
-            file.seek(SeekFrom::Start(start - 1))?;
-            let mut previous = [0u8; 1];
-            file.read_exact(&mut previous)?;
-            starts_on_boundary = previous[0] == b'\n';
-        }
-        file.seek(SeekFrom::Start(start))?;
+        let plan = plan_byte_window(size, bytes, cap, keep_partial_first);
+        file.seek(SeekFrom::Start(plan.read_offset))?;
         // One reservation so read_to_end issues a single large read instead of
         // growing the buffer 32 KiB at a time.
-        let mut data = Vec::with_capacity(effective_bytes as usize);
-        file.by_ref().take(effective_bytes).read_to_end(&mut data)?;
-        let read_len = data.len() as u64;
-        let had_newline = memchr::memchr(b'\n', &data).is_some();
-
-        if !had_newline && start > 0 && bytes >= cap {
-            return Ok(TailWindow {
+        let mut data = Vec::with_capacity(plan.read_len as usize);
+        file.by_ref().take(plan.read_len).read_to_end(&mut data)?;
+        return Ok(match byte_window_rows(&data, &plan, keep_partial_first) {
+            ByteWindowRows::Oversized { resume } => TailWindow {
                 bytes: Vec::new(),
-                start_offset: start + read_len,
-                end_offset: start + read_len,
+                start_offset: resume,
+                end_offset: resume,
                 skipped_oversized: 1,
                 ceiling_reached: true,
                 trailing_oversized: true,
-            });
-        }
-
-        // The returned rows live in data[front..front + complete]; slicing keeps
-        // the partial first row out without the drain memmove.
-        let mut front = 0usize;
-        if start > 0 && !keep_partial_first && !starts_on_boundary {
-            match memchr::memchr(b'\n', &data) {
-                Some(nl) => {
-                    front = nl + 1;
-                    start += (nl + 1) as u64;
+            },
+            ByteWindowRows::Rows {
+                front,
+                complete,
+                start,
+                skipped_oversized,
+            } => {
+                let end_offset = start + complete as u64;
+                // Draining the front keeps the partial first row out with one
+                // small memmove instead of a second full-size window copy.
+                if front > 0 {
+                    data.drain(..front);
                 }
-                None => {
-                    front = data.len();
-                    start += data.len() as u64;
+                data.truncate(complete);
+                TailWindow {
+                    bytes: data,
+                    start_offset: if complete > 0 { start } else { end_offset },
+                    end_offset,
+                    skipped_oversized,
+                    ceiling_reached: plan.window_capped,
+                    trailing_oversized: false,
                 }
             }
-        }
-        let complete = memchr::memrchr(b'\n', &data[front..]).map_or(0, |i| i + 1);
-        let skipped_oversized = usize::from(
-            window_capped && had_newline && front >= data.len() && !keep_partial_first,
-        );
-        let end_offset = start + complete as u64;
-        return Ok(TailWindow {
-            bytes: data[front..front + complete].to_vec(),
-            start_offset: if complete > 0 { start } else { end_offset },
-            end_offset,
-            skipped_oversized,
-            ceiling_reached: window_capped,
-            trailing_oversized: false,
         });
     }
 
@@ -410,6 +482,77 @@ pub struct ForwardRead {
     pub skipped_oversized: usize,
 }
 
+/// Snapshot/trim bookkeeping for one forward read, factored out of
+/// [`forward_read_result`] so the single-copy blob path can apply the same
+/// answers to a caller-owned buffer without materializing a `Vec`.
+#[derive(Debug, Clone, Copy)]
+struct ForwardAnswer {
+    /// Rows (complete, and only complete) occupy `data[row_start..row_start + complete_len]`.
+    row_start: usize,
+    complete_len: usize,
+    new_offset: u64,
+    identity_ok: bool,
+    rotated: bool,
+    truncated: bool,
+    changed: bool,
+    ceiling_reached: bool,
+    skipped_oversized: usize,
+}
+
+fn forward_read_answer(
+    before: &SnapshotIdentity,
+    opened: &SnapshotIdentity,
+    after: &SnapshotIdentity,
+    start: u64,
+    data: &[u8],
+    starts_on_boundary: bool,
+    max_bytes: usize,
+) -> ForwardAnswer {
+    let rotated = before.file_id != opened.file_id || opened.file_id != after.file_id;
+    let truncated = after.size < start || after.size < before.size;
+    let changed = before.size != after.size
+        || before.mtime_ns != after.mtime_ns
+        || opened.size != before.size
+        || opened.mtime_ns != before.mtime_ns;
+    let identity_ok = !rotated && !truncated && !changed;
+
+    let capped = data.len() == max_bytes && start + (data.len() as u64) < before.size;
+    let mut consumed = 0u64;
+    let mut row_start = 0usize;
+    if !starts_on_boundary {
+        match memchr::memchr(b'\n', data) {
+            Some(nl) => {
+                consumed = nl as u64 + 1;
+                row_start = consumed as usize;
+            }
+            None => row_start = data.len(),
+        }
+    }
+    let complete_rows = &data[row_start..];
+    let complete_len = memchr::memrchr(b'\n', complete_rows).map_or(0, |i| i + 1);
+    let trailing = &complete_rows[complete_len..];
+    consumed += complete_len as u64;
+
+    let skipped_oversized = if identity_ok {
+        usize::from(
+            capped && !trailing.is_empty() && memchr::memchr(b'\n', trailing).is_none(),
+        )
+    } else {
+        0
+    };
+    ForwardAnswer {
+        row_start,
+        complete_len,
+        new_offset: if identity_ok { start + consumed } else { start },
+        identity_ok,
+        rotated,
+        truncated,
+        changed,
+        ceiling_reached: capped,
+        skipped_oversized,
+    }
+}
+
 /// Combine the snapshots taken around a read with the bytes read into a
 /// [`ForwardRead`]. Pure so rotation and truncation answers are testable.
 fn forward_read_result(
@@ -421,50 +564,23 @@ fn forward_read_result(
     starts_on_boundary: bool,
     max_bytes: usize,
 ) -> ForwardRead {
-    let rotated = before.file_id != opened.file_id || opened.file_id != after.file_id;
-    let truncated = after.size < start || after.size < before.size;
-    let changed = before.size != after.size
-        || before.mtime_ns != after.mtime_ns
-        || opened.size != before.size
-        || opened.mtime_ns != before.mtime_ns;
-    let identity_ok = !rotated && !truncated && !changed;
-
-    let capped = data.len() == max_bytes && start + (data.len() as u64) < before.size;
-    let mut consumed = 0u64;
-    let mut complete_rows: &[u8] = data;
-    if !starts_on_boundary {
-        match memchr::memchr(b'\n', data) {
-            Some(nl) => {
-                consumed = nl as u64 + 1;
-                complete_rows = &data[consumed as usize..];
-            }
-            None => complete_rows = &[],
-        }
-    }
-    let complete_len = memchr::memrchr(b'\n', complete_rows).map_or(0, |i| i + 1);
-    let trailing = &complete_rows[complete_len..];
-    consumed += complete_len as u64;
-
-    let (bytes, new_offset, skipped_oversized) = if identity_ok {
-        (
-            complete_rows[..complete_len].to_vec(),
-            start + consumed,
-            usize::from(capped && !trailing.is_empty() && memchr::memchr(b'\n', trailing).is_none()),
-        )
+    let answer = forward_read_answer(before, opened, after, start, data, starts_on_boundary, max_bytes);
+    let bytes = if answer.identity_ok {
+        data[answer.row_start..answer.row_start + answer.complete_len].to_vec()
     } else {
-        (Vec::new(), start, 0)
+        Vec::new()
     };
     ForwardRead {
         bytes,
-        new_offset,
-        identity_ok,
-        rotated,
-        truncated,
-        changed,
+        new_offset: answer.new_offset,
+        identity_ok: answer.identity_ok,
+        rotated: answer.rotated,
+        truncated: answer.truncated,
+        changed: answer.changed,
         size: after.size,
         mtime_ns: after.mtime_ns,
-        ceiling_reached: capped,
-        skipped_oversized,
+        ceiling_reached: answer.ceiling_reached,
+        skipped_oversized: answer.skipped_oversized,
     }
 }
 
@@ -506,25 +622,34 @@ pub fn read_forward(path: &Path, start: u64, max_bytes: usize) -> std::io::Resul
     }
     let mut file = File::open(path)?;
     let opened = SnapshotIdentity::stat(path)?;
-    let starts_on_boundary = if start == 0 {
-        true
-    } else {
-        file.seek(SeekFrom::Start(start - 1))?;
-        let mut previous = [0u8; 1];
-        file.read_exact(&mut previous)?;
-        previous[0] == b'\n'
-    };
-    file.seek(SeekFrom::Start(start))?;
+    let probe = u64::from(start > 0);
+    let read_offset = start - probe;
     let want = max_bytes.min((before.size - start) as usize);
-    let mut data = Vec::with_capacity(want);
-    file.by_ref().take(max_bytes as u64).read_to_end(&mut data)?;
+    // The boundary probe byte (when start > 0) rides in the same read as the
+    // window, so the hot path is one seek+read instead of a separate
+    // one-byte seek+read ahead of the main read.
+    file.seek(SeekFrom::Start(read_offset))?;
+    let mut data = Vec::with_capacity(want + probe as usize);
+    file.by_ref()
+        .take(want as u64 + probe)
+        .read_to_end(&mut data)?;
+    if probe == 1 && data.is_empty() {
+        // The file shrank away even the probe byte; the old separate probe
+        // failed here too, with a short read.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "file shrank below the read offset",
+        ));
+    }
+    let front = probe as usize;
+    let starts_on_boundary = start == 0 || data[0] == b'\n';
     let after = SnapshotIdentity::stat(path)?;
     Ok(forward_read_result(
         &before,
         &opened,
         &after,
         start,
-        &data,
+        &data[front..],
         starts_on_boundary,
         max_bytes,
     ))
@@ -952,6 +1077,412 @@ fn map_tail_io_err(err: std::io::Error) -> PyErr {
     }
 }
 
+/// Read up to `buf.len()` bytes at `offset` without disturbing the file
+/// cursor, tolerating short reads from a file that shrinks mid-read. Returns
+/// the number of bytes read.
+#[cfg(all(feature = "extension-module", unix))]
+fn read_up_to_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    let mut filled = 0usize;
+    while !buf.is_empty() {
+        match file.read_at(buf, offset) {
+            Ok(0) => break,
+            Ok(n) => {
+                filled += n;
+                offset += n as u64;
+                let (_, rest) = buf.split_at_mut(n);
+                buf = rest;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
+#[cfg(all(feature = "extension-module", windows))]
+fn read_up_to_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    let mut filled = 0usize;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => break,
+            Ok(n) => {
+                filled += n;
+                offset += n as u64;
+                let (_, rest) = buf.split_at_mut(n);
+                buf = rest;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
+/// A bytes object allocated at an exact length whose buffer is handed to the
+/// caller raw, so a file read can land directly in it. `PyBytes::new_with`
+/// zero-fills the whole buffer first; a read that overwrites every byte makes
+/// that memset wasted work on multi-MiB windows.
+///
+/// The caller initializes the first `filled` bytes of [`UninitBytes::buffer`]
+/// and either returns the object via [`UninitBytes::finish`] or discards it
+/// with [`UninitBytes::abort`]; bytes past `filled` are never read or exposed.
+/// This is the same buffer pattern `PyBytes::new_with` uses internally, minus
+/// the memset.
+#[cfg(feature = "extension-module")]
+struct UninitBytes {
+    obj: *mut pyo3::ffi::PyObject,
+}
+
+#[cfg(feature = "extension-module")]
+impl UninitBytes {
+    fn new(py: Python<'_>, len: usize) -> PyResult<UninitBytes> {
+        unsafe {
+            let obj = pyo3::ffi::PyBytes_FromStringAndSize(
+                std::ptr::null(),
+                len as pyo3::ffi::Py_ssize_t,
+            );
+            if obj.is_null() {
+                return Err(pyo3::PyErr::fetch(py));
+            }
+            Ok(UninitBytes { obj })
+        }
+    }
+
+    fn buffer(&self, len: usize) -> &mut [u8] {
+        unsafe {
+            let raw = pyo3::ffi::PyBytes_AsString(self.obj);
+            std::slice::from_raw_parts_mut(raw.cast(), len)
+        }
+    }
+
+    fn finish(self, py: Python<'_>) -> Py<pyo3::types::PyBytes> {
+        unsafe { Py::from_owned_ptr(py, self.obj) }
+    }
+
+    fn abort(self) {
+        unsafe { pyo3::ffi::Py_DECREF(self.obj) }
+    }
+}
+
+/// How much of a planned window read to inspect for the first newline before
+/// choosing the exact single-copy body read. A first row longer than this
+/// falls back to the buffered path.
+#[cfg(feature = "extension-module")]
+const BLOB_HEAD: usize = 64 * 1024;
+
+/// Locate the front trim of a window from a head prefix of the planned read.
+/// Returns None when the first newline is not in the head (or the probe byte
+/// could not be read at all), asking the caller to use the buffered path.
+#[cfg(feature = "extension-module")]
+fn head_front(head: &[u8], probe: u64, start: u64, keep_partial_first: bool) -> Option<usize> {
+    let front0 = (probe as usize).min(head.len());
+    if start == 0 || keep_partial_first {
+        return Some(front0);
+    }
+    if probe == 1 {
+        if head.is_empty() {
+            return None;
+        }
+        if head[0] == b'\n' {
+            return Some(1);
+        }
+    }
+    memchr::memchr(b'\n', &head[front0..]).map(|nl| front0 + nl + 1)
+}
+
+/// Single-copy `blob=True` byte-window tail: locate the first row boundary
+/// from a small head read, then read the trimmed window straight into one
+/// bytes object. Any unusual shape — a first row longer than [`BLOB_HEAD`], a
+/// probe read that comes up empty, a body read that ends short — falls back
+/// to the buffered [`read_tail_bounded`] path, so selection semantics and
+/// metadata stay identical to the rows paths.
+#[cfg(feature = "extension-module")]
+fn tail_window_blob_py(
+    py: Python<'_>,
+    path: &str,
+    byte_window: u64,
+    max_bytes: usize,
+    keep_partial_first: bool,
+    end: Option<u64>,
+) -> PyResult<(String, Py<PyAny>)> {
+    use pyo3::types::PyBytes;
+    let meta_json = |start_offset: u64,
+                     end_offset: u64,
+                     skipped_oversized: usize,
+                     ceiling_reached: bool,
+                     trailing_oversized: bool|
+     -> PyResult<String> {
+        let meta = json!({
+            "start_offset": start_offset,
+            "end_offset": end_offset,
+            "max_bytes": max_bytes,
+            "skipped_oversized": skipped_oversized,
+            "ceiling_reached": ceiling_reached,
+            "trailing_oversized": trailing_oversized,
+        });
+        serde_json::to_string(&meta)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    };
+    let buffered = |py: Python<'_>| -> PyResult<(String, Py<PyAny>)> {
+        let window = read_tail_bounded(
+            Path::new(path),
+            None,
+            Some(byte_window),
+            keep_partial_first,
+            max_bytes,
+            end,
+        )
+        .map_err(map_tail_io_err)?;
+        Ok((
+            meta_json(
+                window.start_offset,
+                window.end_offset,
+                window.skipped_oversized,
+                window.ceiling_reached,
+                window.trailing_oversized,
+            )?,
+            PyBytes::new(py, &window.bytes).into_any().unbind(),
+        ))
+    };
+    let file = File::open(Path::new(path)).map_err(map_tail_io_err)?;
+    let file_size = file.metadata().map_err(map_tail_io_err)?.len();
+    let size = match end {
+        Some(bound) if bound > file_size => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "end ({bound}) is beyond the file size ({file_size})"
+            )));
+        }
+        Some(bound) => bound,
+        None => file_size,
+    };
+    if size == 0 {
+        return Ok((
+            meta_json(0, 0, 0, false, false)?,
+            PyBytes::new(py, b"").into_any().unbind(),
+        ));
+    }
+    let plan = plan_byte_window(size, byte_window, max_bytes as u64, keep_partial_first);
+    let head_len = plan.read_len.min(BLOB_HEAD as u64 + plan.probe) as usize;
+    let mut head = vec![0u8; head_len];
+    let head_filled = read_up_to_at(&file, &mut head, plan.read_offset).map_err(map_tail_io_err)?;
+    head.truncate(head_filled);
+    let Some(front) = head_front(&head, plan.probe, plan.start, keep_partial_first) else {
+        return buffered(py);
+    };
+    let body_len = plan.read_len - front as u64;
+    let body_offset = plan.read_offset + front as u64;
+    let uninit = UninitBytes::new(py, body_len as usize)?;
+    let filled = match read_up_to_at(&file, uninit.buffer(body_len as usize), body_offset) {
+        Ok(filled) => filled,
+        Err(e) => {
+            uninit.abort();
+            return Err(map_tail_io_err(e));
+        }
+    };
+    if filled < body_len as usize {
+        uninit.abort();
+        return buffered(py);
+    }
+    // The window start adjusted onto the first row boundary.
+    let start_adj = plan.start + front as u64 - plan.probe;
+    let complete = {
+        let body = uninit.buffer(body_len as usize);
+        if body.is_empty() {
+            0
+        } else if body[body.len() - 1] == b'\n' {
+            body.len()
+        } else {
+            match memchr::memrchr(b'\n', body) {
+                Some(i) => i + 1,
+                // No newline in the whole window: the oversized answer — but
+                // only when the front trim found no newline either, matching
+                // byte_window_rows' `!had_newline`.
+                None if front == plan.probe as usize && plan.start > 0 && plan.bytes >= plan.cap => {
+                    let resume = plan.start + (plan.read_len - plan.probe);
+                    uninit.abort();
+                    return Ok((
+                        meta_json(resume, resume, 1, true, true)?,
+                        PyBytes::new(py, b"").into_any().unbind(),
+                    ));
+                }
+                None => 0,
+            }
+        }
+    };
+    let end_offset = start_adj + complete as u64;
+    // skipped_oversized stays 0 here: reaching this point means the window
+    // contained a newline (byte_window_rows assigns 1 only together with the
+    // oversized arm above).
+    let meta = meta_json(
+        if complete > 0 { start_adj } else { end_offset },
+        end_offset,
+        0,
+        plan.window_capped,
+        false,
+    )?;
+    if complete == body_len as usize {
+        Ok((meta, uninit.finish(py).into_any()))
+    } else {
+        let data = {
+            let body = uninit.buffer(body_len as usize);
+            PyBytes::new(py, &body[..complete])
+        };
+        uninit.abort();
+        Ok((meta, data.into_any().unbind()))
+    }
+}
+
+/// Single-copy `blob=True` forward read: same head-then-body strategy as
+/// [`tail_window_blob_py`]; unusual shapes fall back to the buffered
+/// [`read_forward`], and identity/rotation/truncation answers come from the
+/// same [`forward_read_answer`] bookkeeping.
+#[cfg(feature = "extension-module")]
+fn read_forward_blob_py(
+    py: Python<'_>,
+    path: &str,
+    offset: u64,
+    max_bytes: usize,
+) -> PyResult<(String, Py<PyAny>)> {
+    use pyo3::types::PyBytes;
+    let meta_json = |answer: &ForwardAnswer,
+                     size: u64,
+                     mtime_ns: i64,
+                     new_offset: u64|
+     -> PyResult<String> {
+        let meta = json!({
+            "new_offset": new_offset,
+            "identity_ok": answer.identity_ok,
+            "rotated": answer.rotated,
+            "truncated": answer.truncated,
+            "changed": answer.changed,
+            "size": size,
+            "mtime_ns": mtime_ns,
+            "max_bytes": max_bytes,
+            "ceiling_reached": answer.ceiling_reached,
+            "skipped_oversized": answer.skipped_oversized,
+        });
+        serde_json::to_string(&meta)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    };
+    let buffered = |py: Python<'_>| -> PyResult<(String, Py<PyAny>)> {
+        let result = read_forward(Path::new(path), offset, max_bytes).map_err(map_tail_io_err)?;
+        let new_offset = result.new_offset;
+        Ok((
+            meta_json(
+                &ForwardAnswer {
+                    row_start: 0,
+                    complete_len: result.bytes.len(),
+                    new_offset: result.new_offset,
+                    identity_ok: result.identity_ok,
+                    rotated: result.rotated,
+                    truncated: result.truncated,
+                    changed: result.changed,
+                    ceiling_reached: result.ceiling_reached,
+                    skipped_oversized: result.skipped_oversized,
+                },
+                result.size,
+                result.mtime_ns,
+                new_offset,
+            )?,
+            PyBytes::new(py, &result.bytes).into_any().unbind(),
+        ))
+    };
+    if max_bytes == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "max_bytes must be greater than 0",
+        ));
+    }
+    let before = SnapshotIdentity::stat(Path::new(path)).map_err(map_tail_io_err)?;
+    if offset > before.size {
+        // The saved offset no longer exists: only a fresh scan from 0 is safe.
+        let answer = ForwardAnswer {
+            row_start: 0,
+            complete_len: 0,
+            new_offset: 0,
+            identity_ok: false,
+            rotated: false,
+            truncated: true,
+            changed: false,
+            ceiling_reached: false,
+            skipped_oversized: 0,
+        };
+        return Ok((
+            meta_json(&answer, before.size, before.mtime_ns, 0)?,
+            PyBytes::new(py, b"").into_any().unbind(),
+        ));
+    }
+    let file = File::open(Path::new(path)).map_err(map_tail_io_err)?;
+    let opened = SnapshotIdentity::stat(Path::new(path)).map_err(map_tail_io_err)?;
+    let probe = u64::from(offset > 0);
+    let want = max_bytes.min((before.size - offset) as usize);
+    let head_len = (want + probe as usize).min(BLOB_HEAD + probe as usize);
+    let mut head = vec![0u8; head_len];
+    let head_filled = read_up_to_at(&file, &mut head, offset - probe).map_err(map_tail_io_err)?;
+    head.truncate(head_filled);
+    if probe == 1 && head.is_empty() {
+        // The old separate probe failed here with a short read.
+        return Err(pyo3::exceptions::PyOSError::new_err(
+            "file shrank below the read offset",
+        ));
+    }
+    let Some(front) = head_front(&head, probe, offset, false) else {
+        return buffered(py);
+    };
+    let body_len = want + probe as usize - front;
+    let body_offset = offset - probe + front as u64;
+    let uninit = UninitBytes::new(py, body_len)?;
+    let filled = match read_up_to_at(&file, uninit.buffer(body_len), body_offset) {
+        Ok(filled) => filled,
+        Err(e) => {
+            uninit.abort();
+            return Err(map_tail_io_err(e));
+        }
+    };
+    if filled < body_len {
+        uninit.abort();
+        return buffered(py);
+    }
+    // The body starts on a row boundary by construction, so the answer's
+    // partial-first-row trim is already done; its start is the
+    // boundary-adjusted offset. On identity failure the cursor must stay at
+    // the ORIGINAL offset, never the adjusted one.
+    let start_adj = offset + front as u64 - probe;
+    let after = SnapshotIdentity::stat(Path::new(path)).map_err(map_tail_io_err)?;
+    let answer = forward_read_answer(
+        &before,
+        &opened,
+        &after,
+        start_adj,
+        uninit.buffer(body_len),
+        true,
+        max_bytes,
+    );
+    let new_offset = if answer.identity_ok {
+        answer.new_offset
+    } else {
+        offset
+    };
+    let meta = meta_json(&answer, after.size, after.mtime_ns, new_offset)?;
+    if !answer.identity_ok {
+        uninit.abort();
+        return Ok((meta, PyBytes::new(py, b"").into_any().unbind()));
+    }
+    // row_start is 0 by construction; complete_len is the rows' length.
+    let rows_len = answer.row_start + answer.complete_len;
+    if rows_len == body_len {
+        Ok((meta, uninit.finish(py).into_any()))
+    } else {
+        let data = {
+            let body = uninit.buffer(body_len);
+            PyBytes::new(py, &body[..rows_len])
+        };
+        uninit.abort();
+        Ok((meta, data.into_any().unbind()))
+    }
+}
+
 #[cfg(feature = "extension-module")]
 #[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false, errors="strict", end=None, raw=false))]
 fn tail_raw(
@@ -980,7 +1511,7 @@ fn tail_raw(
 }
 
 #[cfg(feature = "extension-module")]
-#[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false, errors="strict", end=None, raw=false))]
+#[pyfunction(signature = (path, lines=None, byte_window=None, max_bytes=None, keep_partial_first=false, errors="strict", end=None, raw=false, blob=false))]
 fn tail_window_raw(
     py: Python<'_>,
     path: &str,
@@ -991,9 +1522,37 @@ fn tail_window_raw(
     errors: &str,
     end: Option<u64>,
     raw: bool,
+    blob: bool,
 ) -> PyResult<(String, Py<PyAny>)> {
-    let mode = parse_errors_for(errors, raw)?;
+    let mode = parse_errors_for(errors, raw || blob)?;
     let limit = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+    if blob {
+        use pyo3::types::PyBytes;
+        if let Some(bytes) = byte_window {
+            return tail_window_blob_py(py, path, bytes, limit, keep_partial_first, end);
+        }
+        // lines-mode blob: the buffered window is already the joined rows.
+        let window = read_tail_bounded(
+            Path::new(path),
+            lines,
+            None,
+            keep_partial_first,
+            limit,
+            end,
+        )
+        .map_err(map_tail_io_err)?;
+        let meta = json!({
+            "start_offset": window.start_offset,
+            "end_offset": window.end_offset,
+            "max_bytes": limit,
+            "skipped_oversized": window.skipped_oversized,
+            "ceiling_reached": window.ceiling_reached,
+            "trailing_oversized": window.trailing_oversized,
+        });
+        let meta_json = serde_json::to_string(&meta)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        return Ok((meta_json, PyBytes::new(py, &window.bytes).into_any().unbind()));
+    }
     let window = read_tail_bounded(
         Path::new(path),
         lines,
@@ -1018,7 +1577,7 @@ fn tail_window_raw(
 }
 
 #[cfg(feature = "extension-module")]
-#[pyfunction(signature = (path, offset=0, max_bytes=None, errors="strict", raw=false))]
+#[pyfunction(signature = (path, offset=0, max_bytes=None, errors="strict", raw=false, blob=false))]
 fn read_forward_raw(
     py: Python<'_>,
     path: &str,
@@ -1026,9 +1585,13 @@ fn read_forward_raw(
     max_bytes: Option<usize>,
     errors: &str,
     raw: bool,
+    blob: bool,
 ) -> PyResult<(String, Py<PyAny>)> {
-    let mode = parse_errors_for(errors, raw)?;
+    let mode = parse_errors_for(errors, raw || blob)?;
     let limit = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+    if blob {
+        return read_forward_blob_py(py, path, offset, limit);
+    }
     let result = read_forward(Path::new(path), offset, limit).map_err(map_tail_io_err)?;
     let meta = json!({
         "new_offset": result.new_offset,

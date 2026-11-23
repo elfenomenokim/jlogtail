@@ -3,6 +3,35 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses `MAJOR.MINOR.PATCH`.
 
+## [0.3.2] - 2026-11-23
+
+### Added
+
+- `blob=True` option on `jlogtail.tail_window(...)` and `jlogtail.read_forward(...)`:
+  returns `(meta, data)` where `data` is ONE `bytes` object holding exactly the
+  selected complete rows, each with its trailing `\n` — `b"".join(row + b"\n" for
+  row in raw_rows)` — instead of a list of per-row `bytes` objects. Nothing is
+  decoded, so `errors` and `raw` are ignored on the blob path; row selection,
+  metadata offsets, snapshot identity, oversized and ceiling answers are identical
+  to the 0.3.1 paths.
+
+### Performance
+
+- The byte-window tail and the forward read now fetch the one boundary probe byte
+  in the same seek+read as the window instead of a separate one-byte read, and the
+  byte-window trim drains the front of the read buffer instead of copying the whole
+  window a second time. The `blob=True` path goes one pass further: a small head
+  read locates the first row boundary, then the trimmed window is read straight
+  into the returned bytes object's buffer — no intermediate `Vec`, no second copy
+  (an oversized first row or a short read falls back to the buffered path).
+  Measured through the Orbit host's `transcript_window` callers on a 380 MB
+  transcript (M5, 50-run mean, `end=size`, hot page cache): `_read_window_before`
+  256 KiB 0.024 -> 0.018 ms and 2 MiB 0.113 -> 0.059 ms, both well below the
+  pre-jlogtail pure-Python read (0.024 / 0.113 ms) that jlogtail 0.3.1 had
+  regressed past (0.051 / 0.224 ms), and at the plain `os.pread` floor; the 2 MiB
+  forward range read halves too, 0.227 -> 0.063 ms. Blob output is byte-identical
+  to the joined 0.3.1 raw rows and the metadata matches decision for decision.
+
 ## [0.3.1] - 2026-11-23
 
 ### Added
